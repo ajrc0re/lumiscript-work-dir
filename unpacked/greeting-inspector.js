@@ -5,6 +5,8 @@ const STATUS_PICK_BUTTON_ID = 'ls-gi-status-pick';
 const STATUS_ACTIVE_BUTTON_ID = 'ls-gi-status-active';
 const STATUS_FORCE_BUTTON_ID = 'ls-gi-status-force';
 const STATUS_COLLAPSE_BUTTON_ID = 'ls-gi-status-collapse';
+const STATUS_RESTORE_BUTTON_ID = 'ls-gi-status-restore';
+const STATUS_ACTION_EVENT = 'greeting-inspector:status-action';
 const ACTIVE_INDEX_VAR = 'greetingInspector.activeIndex';
 const UPCOMING_INDEX_VAR = 'greetingInspector.upcomingIndex';
 const STATUS_COLLAPSED_VAR = 'greetingInspector.statusCollapsed';
@@ -12,7 +14,7 @@ const LAST_ADVANCED_EVENT_VAR = 'greetingInspector.lastAdvancedEvent';
 const GREETING_TRANSITION_MARKER = '---GREETING TRANSITION---';
 const LEGACY_END_SCENE_MARKER = '---END SCENE---';
 const TRANSITION_MARKERS = [GREETING_TRANSITION_MARKER, LEGACY_END_SCENE_MARKER];
-const PRIME_EVENTS = new Set(['MESSAGE_SENT', 'GENERATION_STARTED', 'SETTINGS_UPDATED']);
+const PRIME_EVENTS = new Set(['MESSAGE_SENT', 'GENERATION_STARTED', 'SETTINGS_UPDATED', 'CHAT_SWITCHED']);
 const TRANSITION_EVENTS = new Set(['GENERATION_ENDED', 'GENERATION_STOPPED', 'MESSAGE_EDITED']);
 
 function asText(value) {
@@ -104,7 +106,15 @@ function isActiveChatSettingChange() {
   return data && data.key === 'activeChatId';
 }
 
+function isChatSwitch() {
+  return getEventName() === 'CHAT_SWITCHED';
+}
+
 function isActiveChatClose() {
+  if (isChatSwitch()) {
+    return !asText(data && data.chatId);
+  }
+
   return isActiveChatSettingChange() && !asText(data.value);
 }
 
@@ -118,7 +128,7 @@ function isPreAssemblyGenerationStart() {
 
 function shouldCheckTransitionOnTrigger() {
   const eventName = getEventName();
-  return TRANSITION_EVENTS.has(eventName) || isActiveChatSettingChange();
+  return TRANSITION_EVENTS.has(eventName);
 }
 
 function shouldHandleTrigger() {
@@ -142,6 +152,10 @@ function shouldHandleTrigger() {
 
   if (eventName === 'GENERATION_STARTED') {
     return isPreAssemblyGenerationStart();
+  }
+
+  if (eventName === 'CHAT_SWITCHED') {
+    return true;
   }
 
   return isActiveChatSettingChange();
@@ -238,6 +252,13 @@ function buildGreetingSelectorCss() {
   border-top: 1px solid var(--lumiverse-border, rgba(255, 255, 255, 0.12));
 }
 
+.ls-gi-action-row {
+  padding: 0;
+  border: 0;
+  justify-content: flex-start;
+  flex-wrap: wrap;
+}
+
 .ls-gi-title {
   margin: 0;
   font-size: 18px;
@@ -306,6 +327,11 @@ function buildGreetingSelectorCss() {
   background: var(--lumiverse-accent, #3b82f6);
   border-color: var(--lumiverse-accent, #3b82f6);
   color: var(--lumiverse-accent-text, #ffffff);
+}
+
+.ls-gi-button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 `;
 }
@@ -403,6 +429,44 @@ function buildUpcomingSelectorHtml(character, greetings, activeIndex, selectedIn
 </div>`;
 }
 
+function buildManualActionHtml(character, greetings, activeIndex, upcomingIndex) {
+  const activeGreeting = greetings[activeIndex];
+  const upcomingGreeting = upcomingIndex === null ? null : greetings[upcomingIndex];
+  const activeLabel = activeGreeting
+    ? `${activeGreeting.index} (${activeGreeting.label})`
+    : String(activeIndex);
+  const upcomingLabel = upcomingGreeting
+    ? `${upcomingGreeting.index} (${upcomingGreeting.label})`
+    : 'none';
+  const upcomingText = upcomingGreeting
+    ? displayGreeting(upcomingGreeting.text)
+    : '(no upcoming greeting)';
+
+  return `
+<div class="ls-gi-backdrop">
+  <div class="ls-gi-dialog" role="dialog" aria-modal="true" aria-labelledby="ls-gi-title">
+    <div class="ls-gi-header">
+      <h2 class="ls-gi-title" id="ls-gi-title">Greeting inspector</h2>
+      <button class="ls-gi-button" id="ls-gi-action-cancel" type="button">Close</button>
+    </div>
+    <div class="ls-gi-body">
+      <div class="ls-gi-meta">Active character: ${escapeHtml(character.name || '(unnamed)')}</div>
+      <div class="ls-gi-meta">Active greeting: ${escapeHtml(activeLabel)}</div>
+      <div class="ls-gi-meta">Upcoming greeting: ${escapeHtml(upcomingLabel)}</div>
+      <div class="ls-gi-footer ls-gi-action-row">
+        <button class="ls-gi-button ls-gi-button-primary" id="ls-gi-action-active" type="button">Active</button>
+        <button class="ls-gi-button ls-gi-button-primary" id="ls-gi-action-upcoming" type="button"${upcomingGreeting ? '' : ' disabled'}>Next</button>
+        <button class="ls-gi-button" id="ls-gi-action-force" type="button"${upcomingGreeting ? '' : ' disabled'}>Force</button>
+        <button class="ls-gi-button" id="ls-gi-action-refresh" type="button">Refresh</button>
+      </div>
+      <div class="ls-gi-viewer" aria-label="Upcoming greeting content">
+        <pre class="ls-gi-greeting">${escapeHtml(upcomingText)}</pre>
+      </div>
+    </div>
+  </div>
+</div>`;
+}
+
 function buildStatusCss() {
   return `
 .ls-gi-status {
@@ -433,7 +497,6 @@ function buildStatusCss() {
   border: 1px solid var(--lumiverse-border, rgba(255, 255, 255, 0.18));
   border-radius: 8px;
   box-shadow: 0 10px 28px rgba(0, 0, 0, 0.35);
-  cursor: pointer;
   user-select: none;
 }
 
@@ -466,6 +529,7 @@ function buildStatusCss() {
   flex-shrink: 0;
   color: var(--lumiverse-text-muted, rgba(245, 245, 245, 0.7));
   font-size: 12px;
+  text-align: right;
 }
 
 .ls-gi-status-actions {
@@ -611,7 +675,7 @@ function buildStatusHtml(character, greetings, activeIndex, upcomingIndex, expan
       </div>
     </div>
   </div>
-  <button class="ls-gi-status-restore" type="button" aria-label="Restore greeting widget">GI</button>
+  <button class="ls-gi-status-restore" id="${STATUS_RESTORE_BUTTON_ID}" type="button" aria-label="Restore greeting widget">GI</button>
   <div class="ls-gi-status-popover">
     <div class="ls-gi-status-popover-header">Upcoming greeting for ${escapeHtml(character.name || '(unnamed)')}</div>
     <pre class="ls-gi-status-greeting">${escapeHtml(upcomingText)}</pre>
@@ -719,7 +783,7 @@ async function writeStatusCollapsed(collapsed) {
   return normalizedValue;
 }
 
-async function renderStatusUi(character, greetings, activeIndex, upcomingIndex) {
+async function renderStatusUi(character, greetings, activeIndex, upcomingIndex, chatId) {
   if (!api.ui.dom || !api.ui.dom.inject || !api.ui.dom.addStyle || !api.ui.dom.cleanup) {
     return;
   }
@@ -727,7 +791,6 @@ async function renderStatusUi(character, greetings, activeIndex, upcomingIndex) 
   try {
     await api.ui.dom.cleanup();
     await api.ui.dom.addStyle(buildStatusCss());
-
     let expanded = false;
     let collapsed = await readStatusCollapsed();
     const handle = await api.ui.dom.inject('body', buildStatusHtml(character, greetings, activeIndex, upcomingIndex, expanded, collapsed), {
@@ -736,90 +799,30 @@ async function renderStatusUi(character, greetings, activeIndex, upcomingIndex) 
     });
 
     handle.on('click', (event) => {
-      void (async () => {
-        if (collapsed) {
-          collapsed = false;
-          await writeStatusCollapsed(collapsed);
-          handle.update(buildStatusHtml(character, greetings, activeIndex, upcomingIndex, expanded, collapsed));
-          return;
-        }
+      const targetId = event.targetId || '';
+      let action = '';
 
-        if (event.targetId === STATUS_COLLAPSE_BUTTON_ID) {
-          collapsed = true;
-          await writeStatusCollapsed(collapsed);
-          handle.update(buildStatusHtml(character, greetings, activeIndex, upcomingIndex, expanded, collapsed));
-          return;
-        }
-
-        if (event.targetId === STATUS_ACTIVE_BUTTON_ID) {
-          const selectedIndex = await promptForActiveGreeting(character, greetings, activeIndex);
-
-          if (selectedIndex === null) {
-            await renderStatusUi(character, greetings, activeIndex, upcomingIndex);
-            return;
-          }
-
-          const selectedActiveIndex = await writeActiveIndex(selectedIndex, greetings);
-          const selectedUpcomingIndex = await resetUpcomingIndex(selectedActiveIndex, greetings);
-          await injectNextSceneNote(selectedUpcomingIndex, greetings);
-          await renderStatusUi(character, greetings, selectedActiveIndex, selectedUpcomingIndex);
-
-          if (selectedUpcomingIndex === null) {
-            api.ui.toast(`Active greeting set to ${selectedActiveIndex} (${greetings[selectedActiveIndex].label}). No later greeting is available.`, 'success');
-            return;
-          }
-
-          api.ui.toast(`Active greeting set to ${selectedActiveIndex} (${greetings[selectedActiveIndex].label}); next is ${selectedUpcomingIndex} (${greetings[selectedUpcomingIndex].label}).`, 'success');
-          return;
-        }
-
-        if (event.targetId === STATUS_PICK_BUTTON_ID) {
-          const selectedIndex = await promptForUpcomingGreeting(character, greetings, activeIndex, upcomingIndex);
-
-          if (selectedIndex === null) {
-            await renderStatusUi(character, greetings, activeIndex, upcomingIndex);
-            return;
-          }
-
-          const selectedUpcomingIndex = await writeUpcomingIndex(selectedIndex, activeIndex, greetings);
-
-          if (selectedUpcomingIndex === null) {
-            await renderStatusUi(character, greetings, activeIndex, selectedUpcomingIndex);
-            api.ui.toast('There is no later greeting to use as the upcoming greeting target.', 'warning');
-            return;
-          }
-
-          await injectNextSceneNote(selectedUpcomingIndex, greetings);
-          await renderStatusUi(character, greetings, activeIndex, selectedUpcomingIndex);
-          api.ui.toast(`Upcoming greeting set to ${selectedUpcomingIndex} (${greetings[selectedUpcomingIndex].label}).`, 'success');
-          return;
-        }
-
-        if (event.targetId === STATUS_FORCE_BUTTON_ID) {
-          const result = await advanceToUpcomingGreeting(activeIndex, upcomingIndex, greetings);
-
-          await injectNextSceneNote(result.upcomingIndex, greetings);
-          await renderStatusUi(character, greetings, result.activeIndex, result.upcomingIndex);
-
-          if (result.advancedIndex === null) {
-            api.ui.toast('There is no later greeting to force.', 'warning');
-            return;
-          }
-
-          const insertMessage = result.insertedGreeting
-            ? 'Inserted the greeting into chat.'
-            : 'The greeting was not inserted automatically.';
-
-          api.ui.toast(`Forced greeting transition to ${result.advancedIndex} (${greetings[result.advancedIndex].label}). ${insertMessage} ${nextGreetingMessage(result.upcomingIndex, greetings)}`, 'success');
-          return;
-        }
-
+      if (targetId === STATUS_ACTIVE_BUTTON_ID) {
+        action = 'active';
+      } else if (targetId === STATUS_PICK_BUTTON_ID) {
+        action = 'upcoming';
+      } else if (targetId === STATUS_FORCE_BUTTON_ID) {
+        action = 'force';
+      } else if (targetId === STATUS_COLLAPSE_BUTTON_ID) {
+        collapsed = true;
+        handle.update(buildStatusHtml(character, greetings, activeIndex, upcomingIndex, expanded, collapsed));
+        action = 'collapse';
+      } else if (targetId === STATUS_RESTORE_BUTTON_ID) {
+        collapsed = false;
+        handle.update(buildStatusHtml(character, greetings, activeIndex, upcomingIndex, expanded, collapsed));
+        action = 'restore';
+      } else {
         expanded = !expanded;
         handle.update(buildStatusHtml(character, greetings, activeIndex, upcomingIndex, expanded, collapsed));
-      })().catch((error) => {
-        const message = error && error.message ? error.message : String(error);
-        api.ui.toast(`Greeting picker failed: ${message}`, 'warning');
-      });
+        return;
+      }
+
+      api.broadcast.emit(STATUS_ACTION_EVENT, { action, chatId });
     });
   } catch (error) {
     if (isManualRun()) {
@@ -1376,6 +1379,222 @@ async function promptForUpcomingGreeting(character, greetings, activeIndex, init
   });
 }
 
+async function promptForManualAction(character, greetings, activeIndex, upcomingIndex) {
+  const hasUpcoming = upcomingIndex !== null && greetings[upcomingIndex];
+
+  if (!api.ui.dom || !api.ui.dom.inject || !api.ui.dom.addStyle) {
+    if (await api.ui.confirm('Set the active greeting?', 'Greeting inspector', {
+      confirmLabel: 'Active',
+      cancelLabel: hasUpcoming ? 'More' : 'Refresh',
+    })) {
+      return 'active';
+    }
+
+    if (!hasUpcoming) {
+      return 'refresh';
+    }
+
+    if (await api.ui.confirm('Choose the upcoming greeting?', 'Greeting inspector', {
+      confirmLabel: 'Next',
+      cancelLabel: 'More',
+    })) {
+      return 'upcoming';
+    }
+
+    if (await api.ui.confirm('Force the current upcoming greeting now?', 'Greeting inspector', {
+      confirmLabel: 'Force',
+      cancelLabel: 'Refresh',
+      variant: 'warning',
+    })) {
+      return 'force';
+    }
+
+    return 'refresh';
+  }
+
+  let handle = null;
+  let styleHandle = null;
+  const unsubscribers = [];
+
+  function removeInjectedUi() {
+    for (const unsubscribe of unsubscribers) {
+      try {
+        unsubscribe();
+      } catch {
+        // Listener cleanup is best-effort.
+      }
+    }
+
+    if (handle) {
+      handle.remove();
+    }
+
+    if (styleHandle) {
+      styleHandle.remove();
+    }
+  }
+
+  try {
+    if (api.ui.dom.cleanup) {
+      await api.ui.dom.cleanup();
+    }
+
+    styleHandle = await api.ui.dom.addStyle(buildGreetingSelectorCss());
+    handle = await api.ui.dom.inject('body', buildManualActionHtml(character, greetings, activeIndex, upcomingIndex), {
+      id: SELECTOR_INJECTION_ID,
+      position: 'beforeend',
+    });
+  } catch (error) {
+    removeInjectedUi();
+    const message = error && error.message ? error.message : String(error);
+    api.ui.toast(`Could not open greeting inspector controls: ${message}.`, 'warning');
+    return null;
+  }
+
+  return new Promise((resolve) => {
+    let settled = false;
+
+    function finish(value) {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      removeInjectedUi();
+      resolve(value);
+    }
+
+    unsubscribers.push(handle.on('click', (event) => {
+      if (event.targetId === 'ls-gi-action-cancel') {
+        finish(null);
+        return;
+      }
+
+      if (event.targetId === 'ls-gi-action-active') {
+        finish('active');
+        return;
+      }
+
+      if (event.targetId === 'ls-gi-action-upcoming' && hasUpcoming) {
+        finish('upcoming');
+        return;
+      }
+
+      if (event.targetId === 'ls-gi-action-force' && hasUpcoming) {
+        finish('force');
+        return;
+      }
+
+      if (event.targetId === 'ls-gi-action-refresh') {
+        finish('refresh');
+      }
+    }));
+  });
+}
+
+function registerStatusActionHandler(character, greetings, activeIndex, upcomingIndex, chatId) {
+  if (!api.broadcast || typeof api.broadcast.on !== 'function') {
+    return null;
+  }
+
+  let currentActiveIndex = activeIndex;
+  let currentUpcomingIndex = upcomingIndex;
+
+  function repaint() {
+    return renderStatusUi(character, greetings, currentActiveIndex, currentUpcomingIndex, chatId);
+  }
+
+  return api.broadcast.on(STATUS_ACTION_EVENT, (payload) => {
+    void (async () => {
+      const action = asText(payload && payload.action);
+      const payloadChatId = asText(payload && payload.chatId);
+
+      if (payloadChatId && chatId && payloadChatId !== chatId) {
+        return;
+      }
+
+      if (action === 'collapse') {
+        await writeStatusCollapsed(true);
+        await repaint();
+        return;
+      }
+
+      if (action === 'restore') {
+        await writeStatusCollapsed(false);
+        await repaint();
+        return;
+      }
+
+      if (action === 'active') {
+        const selectedIndex = await promptForActiveGreeting(character, greetings, currentActiveIndex);
+
+        if (selectedIndex === null) {
+          await repaint();
+          return;
+        }
+
+        currentActiveIndex = await writeActiveIndex(selectedIndex, greetings);
+        currentUpcomingIndex = await resetUpcomingIndex(currentActiveIndex, greetings);
+        await injectNextSceneNote(currentUpcomingIndex, greetings);
+        await repaint();
+
+        if (currentUpcomingIndex === null) {
+          api.ui.toast(`Active greeting set to ${currentActiveIndex} (${greetings[currentActiveIndex].label}). No later greeting is available.`, 'success');
+          return;
+        }
+
+        api.ui.toast(`Active greeting set to ${currentActiveIndex} (${greetings[currentActiveIndex].label}); next is ${currentUpcomingIndex} (${greetings[currentUpcomingIndex].label}).`, 'success');
+        return;
+      }
+
+      if (action === 'upcoming') {
+        const selectedIndex = await promptForUpcomingGreeting(character, greetings, currentActiveIndex, currentUpcomingIndex);
+
+        if (selectedIndex === null) {
+          await repaint();
+          return;
+        }
+
+        currentUpcomingIndex = await writeUpcomingIndex(selectedIndex, currentActiveIndex, greetings);
+
+        if (currentUpcomingIndex === null) {
+          await repaint();
+          api.ui.toast('There is no later greeting to use as the upcoming greeting target.', 'warning');
+          return;
+        }
+
+        await injectNextSceneNote(currentUpcomingIndex, greetings);
+        await repaint();
+        api.ui.toast(`Upcoming greeting set to ${currentUpcomingIndex} (${greetings[currentUpcomingIndex].label}).`, 'success');
+        return;
+      }
+
+      if (action === 'force') {
+        const result = await advanceToUpcomingGreeting(currentActiveIndex, currentUpcomingIndex, greetings);
+
+        currentActiveIndex = result.activeIndex;
+        currentUpcomingIndex = result.upcomingIndex;
+        await injectNextSceneNote(currentUpcomingIndex, greetings);
+        await repaint();
+
+        if (result.advancedIndex === null) {
+          api.ui.toast('There is no later greeting to force.', 'warning');
+          return;
+        }
+
+        const insertMessage = result.insertedGreeting
+          ? 'Inserted the greeting into chat.'
+          : 'The greeting was not inserted automatically.';
+
+        api.ui.toast(`Forced greeting transition to ${result.advancedIndex} (${greetings[result.advancedIndex].label}). ${insertMessage} ${nextGreetingMessage(result.upcomingIndex, greetings)}`, 'success');
+      }
+    })().catch((error) => {
+      const message = error && error.message ? error.message : String(error);
+      api.ui.toast(`Greeting picker failed: ${message}`, 'warning');
+    });
+  });
+}
+
 async function main() {
   const manualRun = isManualRun();
 
@@ -1463,23 +1682,73 @@ async function main() {
   activeIndex = advancedState.activeIndex;
   upcomingIndex = advancedState.upcomingIndex;
 
-  if (manualRun) {
-    const selectedIndex = await promptForActiveGreeting(character, greetings, activeIndex);
+  async function renderAndRegisterStatus() {
+    await renderStatusUi(character, greetings, activeIndex, upcomingIndex, activeChat.id);
+    registerStatusActionHandler(character, greetings, activeIndex, upcomingIndex, activeChat.id);
+  }
 
-    if (selectedIndex === null) {
-      await renderStatusUi(character, greetings, activeIndex, upcomingIndex);
+  let manualAction = null;
+  let forceResult = null;
+
+  if (manualRun) {
+    manualAction = await promptForManualAction(character, greetings, activeIndex, upcomingIndex);
+
+    if (manualAction === null) {
+      await renderAndRegisterStatus();
       api.ui.toast('Greeting inspector cancelled.', 'warning');
       return;
     }
 
-    activeIndex = await writeActiveIndex(selectedIndex, greetings);
-    upcomingIndex = await resetUpcomingIndex(activeIndex, greetings);
+    if (manualAction === 'active') {
+      const selectedIndex = await promptForActiveGreeting(character, greetings, activeIndex);
+
+      if (selectedIndex === null) {
+        await renderAndRegisterStatus();
+        api.ui.toast('Greeting inspector cancelled.', 'warning');
+        return;
+      }
+
+      activeIndex = await writeActiveIndex(selectedIndex, greetings);
+      upcomingIndex = await resetUpcomingIndex(activeIndex, greetings);
+    }
+
+    if (manualAction === 'upcoming') {
+      const selectedIndex = await promptForUpcomingGreeting(character, greetings, activeIndex, upcomingIndex);
+
+      if (selectedIndex === null) {
+        await renderAndRegisterStatus();
+        api.ui.toast('Greeting inspector cancelled.', 'warning');
+        return;
+      }
+
+      upcomingIndex = await writeUpcomingIndex(selectedIndex, activeIndex, greetings);
+    }
+
+    if (manualAction === 'force') {
+      forceResult = await advanceToUpcomingGreeting(activeIndex, upcomingIndex, greetings);
+      activeIndex = forceResult.activeIndex;
+      upcomingIndex = forceResult.upcomingIndex;
+    }
   }
 
   const injected = await injectNextSceneNote(upcomingIndex, greetings);
-  await renderStatusUi(character, greetings, activeIndex, upcomingIndex);
+  await renderAndRegisterStatus();
 
   if (!manualRun) {
+    return;
+  }
+
+  if (manualAction === 'force') {
+    if (forceResult.advancedIndex === null) {
+      api.ui.toast('There is no later greeting to force.', 'warning');
+      return;
+    }
+
+    const insertMessage = forceResult.insertedGreeting
+      ? 'Inserted the greeting into chat.'
+      : 'The greeting was not inserted automatically.';
+
+    api.ui.toast(`Forced greeting transition to ${forceResult.advancedIndex} (${greetings[forceResult.advancedIndex].label}). ${insertMessage} ${nextGreetingMessage(forceResult.upcomingIndex, greetings)}`, 'success');
     return;
   }
 
@@ -1491,6 +1760,16 @@ async function main() {
 
     const missingIndex = upcomingIndex === null ? activeIndex + 1 : upcomingIndex;
     api.ui.toast(`Greeting ${missingIndex} is empty or unavailable, so no note was injected.`, 'warning');
+    return;
+  }
+
+  if (manualAction === 'upcoming') {
+    api.ui.toast(`Stored upcoming greeting index ${upcomingIndex}; injected context from ${greetings[upcomingIndex].label}.`, 'success');
+    return;
+  }
+
+  if (manualAction === 'refresh') {
+    api.ui.toast(`Greeting inspector refreshed; injected upcoming-greeting context from ${greetings[upcomingIndex].label}.`, 'success');
     return;
   }
 

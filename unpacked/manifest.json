@@ -10,7 +10,6 @@
       "file": "greeting-inspector.js",
       "type": "trigger",
       "triggers": [
-        "SETTINGS_UPDATED",
         "MESSAGE_SENT",
         "MESSAGE_EDITED",
         "GENERATION_STARTED",
