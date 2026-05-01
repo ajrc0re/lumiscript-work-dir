@@ -1,0 +1,24 @@
+{
+  "format": "lumiscript-manifest-v1",
+  "sourcePack": "trigger.lumiscript.zip",
+  "sourceFormat": "lumiscript-pack-v1",
+  "exportedAt": "2026-04-30T23:30:15.253Z",
+  "convertedAt": "2026-04-30T23:56:09.984Z",
+  "scripts": [
+    {
+      "name": "Greeting_Inspector",
+      "file": "greeting-inspector.js",
+      "type": "trigger",
+      "triggers": [
+        "SETTINGS_UPDATED",
+        "MESSAGE_SENT",
+        "MESSAGE_EDITED",
+        "GENERATION_STARTED",
+        "GENERATION_ENDED",
+        "GENERATION_STOPPED",
+        "ls:startup",
+        "CHAT_SWITCHED"
+      ]
+    }
+  ]
+}
