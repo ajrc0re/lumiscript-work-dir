@@ -1,1 +1,3 @@
 ﻿lumiscript-root.conf
+unpacked/
+!unpacked/README.md
