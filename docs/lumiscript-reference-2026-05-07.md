@@ -1,6 +1,6 @@
 # LumiScript Reference
 
-*Exported 2026-04-30*
+*Exported 2026-05-07*
 
 ---
 
@@ -31,6 +31,8 @@
 | `PRESET_CHANGED` | Settings | `{ presetId }` |
 | `CONNECTION_PROFILE_LOADED` | Settings | `{ connectionId }` |
 | `WORLD_INFO_ACTIVATED` | Settings | `{ entries }` |
+| `REGEX_SCRIPT_CHANGED` | Settings | `{ id, script: RegexScriptInfo }  // create / update / duplicate / reorder / enable / disable. v0.27.0+ — requires regex_scripts permission` |
+| `REGEX_SCRIPT_DELETED` | Settings | `{ id }  // v0.27.0+ — requires regex_scripts permission` |
 | `TOOL_INVOCATION` | Tools | `{ toolName, requestId, args }` |
 
 ---
@@ -110,8 +112,10 @@
 | --- | --- |
 | `api.characters.*` | `characters` |
 | `api.chats.*` | `chats` |
-| `api.worldInfo.*` | `world_books` |
+| `api.worldInfo.* (CRUD + getCapturedActive)` | `world_books` |
+| `api.worldInfo.registerInterceptor / listInterceptors` | `generation` |
 | `api.personas.*` | `personas` |
+| `api.regexScripts.*` | `regex_scripts` |
 | `api.council.*` | free tier, read-only |
 
 ### Tools & Broadcast
@@ -270,18 +274,18 @@
 | `messageId?` | `string` | Undefined for 'create' origins (the row doesn't exist yet). |
 | `content` | `string` | Current content (already transformed by any earlier processors in the chain). |
 | `extra?` | `Record<string, unknown>` | Current extra map (initial.extra + delta-so-far from prior processors). Threaded through the chain even on swipe origins. |
-| `origin` | `'create' | 'update' | 'swipe_add' | 'swipe_update'` | Which write path triggered this invocation. 'create' includes auto-greetings. |
+| `origin` | `'create' | 'update' | 'swipe_add' | 'swipe_update' | 'render'` | Which path triggered this invocation. 'create' includes auto-greetings. 'render' (host ≥0.9.7) fires on per-message display rendering — non-persisting, fires often, returned extra ignored. |
 | `swipeIndex?` | `number` | Set for 'swipe_update' only — zero-based index of the swipe being rewritten. |
 | `userId` | `string` | Owning user id for the write. |
 
 ### MessageContentProcessorResult
 
-*Return value of a registerContentProcessor handler. Return undefined / void to pass through, or a partial patch. content replaces the stored content. extra shallow-merges into existing — keys you omit are PRESERVED. extra is IGNORED on swipe origins (swipes share the parent message's extra). Return ONLY keys you mutated; pristine initial.extra keys are NOT round-tripped to avoid re-stamping unchanged keys on every write.*
+*Return value of a registerContentProcessor handler. Return undefined / void to pass through, or a partial patch. content replaces the stored content. extra shallow-merges into existing — keys you omit are PRESERVED. extra is IGNORED on swipe origins (swipes share the parent message's extra) and on 'render' (no row to mutate; host ≥0.9.7). Return ONLY keys you mutated; pristine initial.extra keys are NOT round-tripped to avoid re-stamping unchanged keys on every write.*
 
 | Field | Type | Description |
 | --- | --- | --- |
-| `content?` | `string` | Replaces the stored content for downstream processors and the DB write. |
-| `extra?` | `Record<string, unknown>` | Delta keys to shallow-merge. Ignored on swipe origins. |
+| `content?` | `string` | Replaces the stored content for downstream processors and the DB write. On 'render', feeds the display-regex pass before paint. |
+| `extra?` | `Record<string, unknown>` | Delta keys to shallow-merge. Ignored on swipe origins and 'render'. |
 
 ### MacroInterceptorOptions
 
@@ -914,6 +918,168 @@
 | `source` | `'keyword' | 'vector'` | How this entry was activated. |
 | `score?` | `number` | Cosine similarity score for vector-activated entries. Absent for keyword-activated entries. |
 
+### WorldInfoInterceptorEntry
+
+*Subset of WorldInfoEntry exposed to a registerInterceptor handler. Read-only — to mutate, return a result patch from the handler.*
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `id` | `string` | Entry UUID. |
+| `worldBookId` | `string` | Parent world book UUID. |
+| `comment` | `string` | Author-facing comment / label for the entry. |
+| `disabled` | `boolean` | Stored disabled flag (or accumulated disable from earlier handlers in the chain). |
+| `constant` | `boolean` | Always-active flag. |
+| `extensions` | `Record<string, unknown>` | Per-extension namespace metadata stored on the entry. |
+| `key` | `readonly string[]` | Primary trigger keywords. |
+| `keysecondary` | `readonly string[]` | Secondary trigger keywords. |
+| `position` | `number` | Injection position. |
+| `depth` | `number` | Injection depth. |
+| `priority` | `number` | Activation priority. |
+| `probability` | `number` | Activation probability (0–100). |
+| `useProbability` | `boolean` | Whether probability gating applies. |
+| `content` | `string` | Entry text content (reflects mutations from earlier handlers in the chain). |
+
+### WorldInfoInterceptorMessage
+
+*One chat message exposed to a registerInterceptor handler.*
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `role` | `'system' | 'user' | 'assistant'` | Message role. |
+| `content` | `string` | Message content. |
+
+### WorldInfoInterceptorCtx
+
+*Passed to a registerInterceptor handler. All fields readonly. Persist cross-turn state via api.chats.update(chatId, { metadata: ... }) — chatMetadata here is a snapshot.*
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `chatId` | `string` | Active chat id. |
+| `characterId` | `string` | Active character id. |
+| `userId?` | `string` | Owning user id. Pass to operator-scoped Spindle calls. |
+| `entries` | `readonly WorldInfoInterceptorEntry[]` | Candidate entries with prior handlers' mutations applied. |
+| `messages` | `readonly WorldInfoInterceptorMessage[]` | Chat-history snapshot. |
+| `chatTurn` | `number` | Turn number for this chat. |
+| `chatMetadata` | `Record<string, unknown>` | Chat-level metadata snapshot. Read-only. |
+
+### WorldInfoInterceptorResult
+
+*Return value of a registerInterceptor handler. Return undefined / void / omit all four arrays for full pass-through. Vote-off precedence: once any handler in the chain votes disabled for an id, no later enabled or forced vote can revive it. mutated is last-write-wins per id.*
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `disabled?` | `readonly string[]` | Entry ids to force-disable. Wins against any later enabled / forced vote. |
+| `enabled?` | `readonly string[]` | Entry ids to un-disable (overrides stored disabled). No effect on entries any handler voted disabled. |
+| `forced?` | `readonly string[]` | Entry ids to force-activate (sets constant=true for this turn). No effect if voted disabled. Independent of enabled — to revive a stored-disabled entry, vote BOTH enabled and forced. |
+| `mutated?` | `readonly { id: string; content: string }[]` | Per-entry content overrides for this turn only. Stored entry unchanged. Last-write-wins per id. |
+
+### WorldInfoInterceptorOptions
+
+*Passed to api.worldInfo.registerInterceptor(handler, options?).*
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `id?` | `string` | Stable identifier. Re-registration with the same id replaces the prior entry. Auto-generated ('auto-1', etc.) when omitted. |
+| `priority?` | `number` | Lower runs first. Default 100. Tie-broken by registration order. Each handler sees prior handlers' decisions applied to the entry list. |
+| `timeoutMs?` | `number` | Per-invocation soft timeout (ms). Default 2000. Host's outer 10s budget is shared across all extensions; keep handlers fast — the chain fires before activation, prompt assembly, and the LLM call. |
+
+### RegisteredWorldInfoInterceptorInfo
+
+*Returned by api.worldInfo.listInterceptors(). Diagnostic surface — un-gated.*
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `scriptId` | `string` | Owning script id. |
+| `scriptName` | `string` | Owning script display name. |
+| `id` | `string` | Resolved entry id (auto-generated or user-provided). |
+| `priority` | `number` | Effective priority value. |
+| `timeoutMs` | `number` | Effective per-invocation timeout (ms). |
+
+### RegexScriptInfo
+
+*Snapshot of a regex find/replace script. Returned by api.regexScripts.list / get / findByName / getActive / create / update. Field names are camelCase translations of the underlying snake_case host DTO.*
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `id` | `string` | Unique row id. |
+| `name` | `string` | Display name shown in the regex panel. |
+| `scriptId` | `string` | Stable, normalized identifier (lowercase + underscores) for cross-instance references. Distinct from id. |
+| `findRegex` | `string` | Pattern compiled with the JavaScript regex engine. |
+| `replaceString` | `string` | Replacement template. Supports $1 / $&amp; / $&lt;name&gt; capture references. |
+| `flags` | `string` | Any subset of "gimsu". |
+| `placement` | `RegexPlacement[]` | Which message roles the rule applies to. |
+| `scope` | `RegexScope` | Scope tier: 'global' \| 'character' \| 'chat'. |
+| `scopeId` | `string | null` | Required when scope is non-global; null otherwise. |
+| `target` | `RegexTarget` | When the rule fires: 'prompt' (during assembly) \| 'response' (after LLM stream) \| 'display' (per render). |
+| `minDepth` | `number | null` | Lower bound on chat-history depth (0 = latest), or null for unbounded. |
+| `maxDepth` | `number | null` | Upper bound on chat-history depth, or null for unbounded. |
+| `trimStrings` | `string[]` | Additional substrings stripped from output after the regex pass. |
+| `runOnEdit` | `boolean` | Re-run the rule when a message is edited. |
+| `substituteMacros` | `RegexMacroMode` | How CBS / {{...}} macros inside the rule resolve: 'none' \| 'raw' \| 'escaped'. |
+| `disabled` | `boolean` | When true, the rule is registered but not active. |
+| `sortOrder` | `number` | Lower values run earlier within the same scope tier. |
+| `description` | `string` | Free-form note. |
+| `folder` | `string` | Folder label shown in the regex panel. |
+| `metadata` | `Record<string, unknown>` | Arbitrary metadata namespaced to the creating extension. |
+| `createdAt` | `number` | Unix epoch seconds. |
+| `updatedAt` | `number` | Unix epoch seconds. |
+
+### RegexScriptListOptions
+
+*Filter options for api.regexScripts.list().*
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `scope?` | `'global' | 'character' | 'chat'` | Filter to a single scope. Omit to include all scopes. |
+| `scopeId?` | `string` | Required when scope is 'character' or 'chat'. Ignored otherwise. |
+| `target?` | `'prompt' | 'response' | 'display'` | Filter by execution target. |
+| `limit?` | `number` | Page size. Default 50, max 200. |
+| `offset?` | `number` | Pagination offset. |
+
+### RegexScriptActiveOptions
+
+*Required + optional fields for api.regexScripts.getActive(). Mirrors the resolution Lumiverse uses internally during a generation: only enabled rules, only rules whose target matches, only rules whose scope applies.*
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `target` | `'prompt' | 'response' | 'display'` | Required. The execution target to resolve for. |
+| `characterId?` | `string` | Include character-scoped rules attached to this character. |
+| `chatId?` | `string` | Include chat-scoped rules attached to this chat. |
+
+### RegexScriptCreateInput
+
+*Passed to api.regexScripts.create(input). Only name and findRegex are required; everything else gets host-side defaults.*
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `name` | `string` | Display name. |
+| `findRegex` | `string` | Pattern (JavaScript regex). |
+| `replaceString?` | `string` | Replacement template. Default empty string. |
+| `flags?` | `string` | Any subset of "gimsu". Default "gi". |
+| `placement?` | `RegexPlacement[]` | Default ["ai_output"]. |
+| `scope?` | `RegexScope` | Default 'global'. |
+| `scopeId?` | `string | null` | Required when scope is non-global. |
+| `target?` | `RegexTarget` | Default 'response'. |
+| `minDepth?` | `number | null` | Lower depth bound. |
+| `maxDepth?` | `number | null` | Upper depth bound. |
+| `trimStrings?` | `string[]` | Additional substrings stripped from output. |
+| `runOnEdit?` | `boolean` | Re-run on edit. |
+| `substituteMacros?` | `RegexMacroMode` | How CBS / {{...}} macros inside the rule resolve. Default 'none'. |
+| `disabled?` | `boolean` | Create as disabled. |
+| `sortOrder?` | `number` | Default 0. |
+| `description?` | `string` | Free-form note. |
+| `folder?` | `string` | Folder label. |
+| `metadata?` | `Record<string, unknown>` | Arbitrary metadata. |
+| `scriptId?` | `string` | Stable identifier. Normalized to lowercase + underscores by the host. |
+
+### RegexScriptUpdateInput
+
+*Passed to api.regexScripts.update(scriptId, input). Same shape as RegexScriptCreateInput but ALL fields optional.*
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `(all RegexScriptCreateInput fields, all optional)?` | `—` | Only the fields you provide are updated; omitted fields are left unchanged. |
+
 ### Persona
 
 *Returned by api.personas.get / getDefault / getActive / create / update.*
@@ -1467,6 +1633,8 @@
 | `entries.delete` | entryId | Delete an entry by ID. |
 | `entries.listByAutomationIdPrefix` | prefix | Find all entries across all world books whose automationId starts with the given prefix. Useful for enumerating / cleaning up entries a script owns (e.g. "lumiscript:&lt;scriptId&gt;:" convention). Returns WorldInfoEntry[]; O(books × entries-per-book). |
 | `getCapturedActive` | chatId? | Get all entries that would activate for the current chat (full pipeline). |
+| `registerInterceptor` | handler, options? | Register a handler that runs BEFORE world info activation. Returns disable / enable / force / mutate decisions for the candidate entries. Returns handle { id, remove }. Multiple handlers compose by priority; vote-off precedence on disabled. 2s soft timeout (configurable). Requires generation. v0.27.0+. |
+| `listInterceptors` | — | Sync read of all currently-registered world-info interceptors. Diagnostic surface. Returns RegisteredWorldInfoInterceptorInfo[]. v0.27.0+. |
 
 ### api.personas
 
@@ -1481,6 +1649,18 @@
 | `delete` | personaId | Delete a persona. |
 | `switchActive` | personaId \| null | Switch the active persona. Pass null to deactivate. |
 | `getWorldBook` | personaId | Get the world book attached to a persona. |
+
+### api.regexScripts
+
+| Method | Arguments | Description |
+| --- | --- | --- |
+| `list` | options? | List regex find/replace scripts (paginated). Options: scope, scopeId (required for character/chat scope), target ('prompt'\|'response'\|'display'), limit (max 200), offset. Returns { data: RegexScriptInfo[], total }. |
+| `get` | scriptId | Get a single regex script by id. Returns null if not found. |
+| `findByName` | name, scope? | Find the first regex script whose name exactly matches. Convenience over list() — pages through. O(scripts) worst case. |
+| `getActive` | options | Resolve enabled rules that would actually fire for the given target + character/chat context, merged across global + character + chat scopes and ordered by scope tier then sortOrder. Mirrors Lumiverse's internal resolution. Required: target. Optional: characterId, chatId. |
+| `create` | input | Create a new regex script. name and findRegex are required; everything else gets host-side defaults (placement: ['ai_output'], scope: 'global', target: 'response', flags: 'gi', etc.). |
+| `update` | scriptId, input | Update a regex script. All fields optional; only provided fields are touched. Throws if the script is not found. |
+| `delete` | scriptId | Delete a regex script. Returns true if the row was deleted. |
 
 ### api.council
 
