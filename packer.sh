@@ -1,23 +1,21 @@
 #!/usr/bin/env bash
 #
-# packer.sh — toggle between unpacking and packing LumiScript archives.
+# packer.sh - toggle between unpacking and packing LumiScript archives.
 #
-# Bash equivalent of packer.ps1. By default, acts as a toggle:
+# This wrapper is self-contained within this repository:
 #
-#   - If ./unpacked/manifest.json exists, packs ./unpacked into the configured
-#     LumiScript storage exports directory by running scripts/js2pack.ts.
-#   - If ./unpacked/manifest.json does not exist, unpacks the configured
-#     storage export zip into ./unpacked by running scripts/pack2js.ts.
+#   - If ./unpacked/manifest.json exists, it packs ./unpacked into
+#     ./zips/to-be-imported.lumiscript.zip.
+#   - If ./unpacked/manifest.json does not exist, it unpacks
+#     ./zips/trigger.lumiscript.zip into ./unpacked. If trigger.lumiscript.zip
+#     is absent, it falls back to ./zips/export.lumiscript.zip.
 #
 # Usage:
 #   ./packer.sh             # toggle (default)
 #   ./packer.sh pack        # explicitly pack
 #   ./packer.sh unpack      # explicitly unpack
-#   ./packer.sh validate    # validate configured paths only
+#   ./packer.sh validate    # validate local tool paths only
 #   ./packer.sh -h          # this help
-#
-# Requires lumiscript-root.conf in this directory. LUMISCRIPT_ROOT must point to
-# a directory containing repo/ and storage/.
 
 set -euo pipefail
 
@@ -41,70 +39,52 @@ case "$action" in
 esac
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-config_path="$script_dir/lumiscript-root.conf"
-
-trim() {
-  local value="$1"
-  value="${value#"${value%%[![:space:]]*}"}"
-  value="${value%"${value##*[![:space:]]}"}"
-  printf '%s' "$value"
-}
-
-read_lumiscript_root() {
-  if [[ ! -f "$config_path" ]]; then
-    echo "Error: missing config file '$config_path'." >&2
-    exit 1
-  fi
-
-  local line value root=""
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    line="${line%$'\r'}"
-    value="$(trim "$line")"
-    if [[ -z "$value" || "$value" == \#* ]]; then
-      continue
-    fi
-    if [[ "$value" =~ ^LUMISCRIPT_ROOT[[:space:]]*=(.*)$ ]]; then
-      root="$(trim "${BASH_REMATCH[1]}")"
-      if [[ "$root" == \"*\" && "$root" == *\" ]]; then
-        root="${root:1:${#root}-2}"
-      elif [[ "$root" == \'*\' && "$root" == *\' ]]; then
-        root="${root:1:${#root}-2}"
-      fi
-      break
-    fi
-  done < "$config_path"
-
-  if [[ -z "$root" ]]; then
-    echo "Error: '$config_path' must define LUMISCRIPT_ROOT." >&2
-    exit 1
-  fi
-  if [[ "$root" != /* ]]; then
-    echo "Error: LUMISCRIPT_ROOT must be an absolute path; got '$root'." >&2
-    exit 1
-  fi
-  if [[ ! -d "$root/repo" || ! -d "$root/storage" ]]; then
-    echo "Error: LUMISCRIPT_ROOT '$root' must contain repo/ and storage/ directories." >&2
-    exit 1
-  fi
-
-  printf '%s' "$root"
-}
-
-lumiscript_root="$(read_lumiscript_root)"
-repo_root="$lumiscript_root/repo"
-storage_dir="$lumiscript_root/storage"
-exports_dir="$storage_dir/exports"
-scripts_dir="$repo_root/scripts"
+tools_dir="$script_dir/tools/lumiscript-pack"
+pack2js="$tools_dir/pack2js.ts"
+js2pack="$tools_dir/js2pack.ts"
 unpacked_dir="$script_dir/unpacked"
 manifest_path="$unpacked_dir/manifest.json"
-export_zip="$exports_dir/trigger.lumiscript.zip"
+exports_dir="$script_dir/zips"
+primary_export_zip="$exports_dir/trigger.lumiscript.zip"
+fallback_export_zip="$exports_dir/export.lumiscript.zip"
 import_zip="$exports_dir/to-be-imported.lumiscript.zip"
 
-if [[ ! -f "$scripts_dir/pack2js.ts" || ! -f "$scripts_dir/js2pack.ts" ]]; then
-  echo "Error: expected LumiScript CLI tools under '$scripts_dir'." >&2
-  echo "Check LUMISCRIPT_ROOT in '$config_path'." >&2
+require_command() {
+  local command_name="$1"
+
+  if ! command -v "$command_name" >/dev/null 2>&1; then
+    echo "Error: required command '$command_name' was not found on PATH." >&2
+    exit 1
+  fi
+}
+
+validate_paths() {
+  require_command bun
+  require_command zip
+  require_command unzip
+
+  if [[ ! -f "$pack2js" || ! -f "$js2pack" ]]; then
+    echo "Error: expected repo-local LumiScript tools under '$tools_dir'." >&2
+    exit 1
+  fi
+}
+
+choose_export_zip() {
+  if [[ -f "$primary_export_zip" ]]; then
+    printf '%s' "$primary_export_zip"
+    return
+  fi
+
+  if [[ -f "$fallback_export_zip" ]]; then
+    printf '%s' "$fallback_export_zip"
+    return
+  fi
+
+  echo "Error: cannot unpack because neither '$primary_export_zip' nor '$fallback_export_zip' exists." >&2
   exit 1
-fi
+}
+
+validate_paths
 
 if [[ "$action" == "toggle" ]]; then
   if [[ -f "$manifest_path" ]]; then
@@ -116,9 +96,16 @@ fi
 
 case "$action" in
   validate)
-    echo "LUMISCRIPT_ROOT is valid: $lumiscript_root"
-    echo "Repo root: $repo_root"
-    echo "Storage root: $storage_dir"
+    echo "Repo-local LumiScript tools are available: $tools_dir"
+    echo "Unpacked directory: $unpacked_dir"
+    echo "Import zip: $import_zip"
+    if [[ -f "$primary_export_zip" ]]; then
+      echo "Export zip: $primary_export_zip"
+    elif [[ -f "$fallback_export_zip" ]]; then
+      echo "Export zip: $fallback_export_zip"
+    else
+      echo "Export zip: missing"
+    fi
     ;;
   pack)
     if [[ ! -f "$manifest_path" ]]; then
@@ -127,16 +114,11 @@ case "$action" in
     fi
     mkdir -p "$exports_dir"
     echo "Packing $unpacked_dir into $import_zip"
-    cd "$repo_root"
-    bun scripts/js2pack.ts "$unpacked_dir" --output "$import_zip"
+    bun "$js2pack" "$unpacked_dir" --output "$import_zip"
     ;;
   unpack)
-    if [[ ! -f "$export_zip" ]]; then
-      echo "Error: cannot unpack because '$export_zip' does not exist." >&2
-      exit 1
-    fi
+    export_zip="$(choose_export_zip)"
     echo "Unpacking $export_zip into $unpacked_dir"
-    cd "$repo_root"
-    bun scripts/pack2js.ts "$export_zip" "$unpacked_dir" --force
+    bun "$pack2js" "$export_zip" "$unpacked_dir" --force
     ;;
 esac

@@ -1,8 +1,9 @@
-Legacy local zip scratch space.
+Local LumiScript zip workspace.
 
-The packer wrappers now read work-dir/lumiscript-root.conf and use the configured
-LumiScript storage exports directory:
+The packer wrappers use this directory directly:
 
-- storage/exports/trigger.lumiscript.zip for unpacking
-- storage/exports/to-be-imported.lumiscript.zip for packing
-**must match that exact name!**
+- `trigger.lumiscript.zip` for unpacking
+- `to-be-imported.lumiscript.zip` for packing
+
+If `trigger.lumiscript.zip` is absent, the wrappers fall back to
+`export.lumiscript.zip`.

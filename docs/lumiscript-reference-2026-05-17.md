@@ -1,6 +1,6 @@
 # LumiScript Reference
 
-*Exported 2026-05-07*
+*Exported 2026-05-17*
 
 ---
 
@@ -10,6 +10,7 @@
 | --- | --- | --- |
 | `ls:startup` | LumiScript | `{ __event: "ls:startup" }` |
 | `ls:teardown` | LumiScript | `{ reason: 'disabled' | 'deleted', scriptId, scriptName }` |
+| `ls:reload` | LumiScript | `{ reason: 'autosave' | 'manual', previousCodeHash, currentCodeHash, previousLength, currentLength, triggeredAt }` |
 | `MESSAGE_SENT` | Chat | `{ chatId, message }` |
 | `MESSAGE_EDITED` | Chat | `{ chatId, message }` |
 | `MESSAGE_DELETED` | Chat | `{ chatId, messageId }` |
@@ -27,10 +28,14 @@
 | `CHARACTER_DELETED` | Entities | `{ id }` |
 | `CHARACTER_DUPLICATED` | Entities | `{ id, newId }` |
 | `PERSONA_CHANGED` | Entities | `{ persona }` |
+| `WORLD_INFO_ACTIVATED` | World Info | `{ entries }` |
+| `WORLD_BOOK_CHANGED` | World Info | `{ id, worldBook }` |
+| `WORLD_BOOK_DELETED` | World Info | `{ id }` |
+| `WORLD_BOOK_ENTRY_CHANGED` | World Info | `{ id, worldBookId, entry }` |
+| `WORLD_BOOK_ENTRY_DELETED` | World Info | `{ id, worldBookId }` |
 | `SETTINGS_UPDATED` | Settings | `{ key, value }` |
 | `PRESET_CHANGED` | Settings | `{ presetId }` |
 | `CONNECTION_PROFILE_LOADED` | Settings | `{ connectionId }` |
-| `WORLD_INFO_ACTIVATED` | Settings | `{ entries }` |
 | `REGEX_SCRIPT_CHANGED` | Settings | `{ id, script: RegexScriptInfo }  // create / update / duplicate / reorder / enable / disable. v0.27.0+ — requires regex_scripts permission` |
 | `REGEX_SCRIPT_DELETED` | Settings | `{ id }  // v0.27.0+ — requires regex_scripts permission` |
 | `TOOL_INVOCATION` | Tools | `{ toolName, requestId, args }` |
@@ -115,6 +120,7 @@
 | `api.worldInfo.* (CRUD + getCapturedActive)` | `world_books` |
 | `api.worldInfo.registerInterceptor / listInterceptors` | `generation` |
 | `api.personas.*` | `personas` |
+| `api.presets.*` | `presets` |
 | `api.regexScripts.*` | `regex_scripts` |
 | `api.council.*` | free tier, read-only |
 
@@ -131,6 +137,7 @@
 | `api.events.*` | `event_tracking` |
 | `api.tokens.*` | *none* |
 | `api.db.*` | *none* |
+| `api.rpc.*` | *none* |
 
 ---
 
@@ -151,6 +158,16 @@
 | `ls:collection:size-warning` | `{ name, scope, scriptId, bytes }` | auto — collection exceeds 10 MB soft threshold |
 
 *The `ls:` prefix is reserved for LumiScript engine events. Use any other name for custom events between scripts.*
+
+---
+
+## Directives
+
+LumiScript **runtime directives** are special comments that change how the runtime treats your script. They live anywhere at line start in the script source and follow the form `// @ls:<directive-name>`. The `@ls:` prefix distinguishes runtime-active directives from passive frontmatter tags like `@description`, `@author`, `@version`, `@tags` — those are read by humans and the pack import/export tooling but don't affect runtime behavior. Detection happens at `update_script` time (each code save); no persistence, no schema change.
+
+| Directive | Applies to | What it does |
+| --- | --- | --- |
+| `// @ls:reload-on-edit` | Enabled trigger scripts (libraries are loaded on-demand and ignore the directive). | Opts the script INTO automatic hot-reload after a code save. Without this directive, the script's closures stay stale until the next real trigger fire or until the user clicks the Reload button on the editor topbar. Add the directive to scripts whose module-scope code is idempotent and cheap (no expensive LLM calls, no duplicate DB writes, no leaked timers). The body re-runs end-to-end on each edit ~500ms after the autosave settles. |
 
 ---
 
@@ -214,6 +231,23 @@
 | --- | --- | --- |
 | `role?` | `'user' | 'assistant' | 'system'` | Sender role. Default 'user'. |
 | `metadata?` | `Record<string, unknown>` | Arbitrary metadata to attach. |
+| `triggerGeneration?` | `boolean` | When true, the host triggers a normal LLM continuation after the message is appended (full preset / persona / world info / regex / character card / streaming pipeline — same as the user pressing Enter on an empty input bar). Use for click-to-respond UIs where the script wants the LLM to immediately reply to its appended message. Requires Lumiverse host &gt;= 0.9.x with triggerGeneration support (lumiverse-spindle-types &gt;= 0.4.66); silently ignored on older hosts. v0.27.4+. |
+| `generation?` | `ChatGenerationOptions` | Per-call overrides for the triggered generation (connection / persona / preset / parameters / target character / council retention). Only consulted when triggerGeneration is true; silently ignored otherwise. Each field is optional and falls through to the active chat's defaults when omitted. v0.27.4+. |
+
+### ChatGenerationOptions
+
+*Per-call generation overrides for api.chat.sendMessage(content, { triggerGeneration: true, generation: ... }). Mirrors the host's ChatAppendGenerationOptionsDTO 1:1 in camelCase. Each field is optional; omitted fields fall through to the active chat's resolved defaults (same as a manual UI generation). Use this when a tool script needs to deviate from the user's normal chat configuration for a single triggered generation. v0.27.4+.*
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `connectionId?` | `string` | Override which connection profile to use. Falls back to the user's default connection. |
+| `personaId?` | `string` | Override which persona to use. Falls back to the user's active persona setting. |
+| `personaAddonStates?` | `Record<string, boolean>` | Per-addon enable/disable map for the chosen persona. Keys are addon ids; values are booleans. Omitted addons inherit chat-level state. |
+| `presetId?` | `string` | Override which preset to use. Falls back to the active preset setting (activeLoomPresetId), then to the connection's attached preset. |
+| `forcePresetId?` | `boolean` | When true, forces the supplied presetId over a connection-bound preset. Currently only consulted by the host's impersonation oneliner pipeline; triggerGeneration runs as generation_type "normal" where this field is a silent no-op. Exposed for fidelity with the host DTO. |
+| `parameters?` | `Record<string, unknown>` | Per-call parameter overrides (temperature, max_tokens, top_p, etc.) layered on the resolved preset's parameters. Provider-specific keys accepted; forwarded verbatim. |
+| `targetCharacterId?` | `string` | For group chats only: which character should respond. Falls back to the chat's character_id. |
+| `retainCouncil?` | `boolean` | When true, retains council-tool results from the previous generation rather than re-running them. Useful for cheap regenerate-style flows where the council context hasn't changed. Default false. |
 
 ### MessagePatch
 
@@ -511,6 +545,28 @@
 | `position?` | `'header' | 'footer'` | Semantic position within the message bubble. 'footer' (default): after content/controls. 'header': before all content. |
 | `id?` | `string` | Stable ID for idempotent injection. Re-using the same ID updates the existing element instead of creating a duplicate. |
 
+### DOMDelegateOptions
+
+*Options for api.ui.dom.delegate(selector, event, handler, options?). v0.27.1+.*
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `root?` | `'chat' | 'document'` | Where to attach the actual host-side capture listener. 'chat' (default): restricts matching to chat content; matches descendants of [data-message-id]. 'document': matches anywhere in the page (including Lumiverse's own UI surfaces). Both gate on app_manipulation. |
+| `messageId?` | `string` | Limit matching to a specific message id. Has no effect when root is "document". |
+| `preventDefault?` | `boolean | ConditionalPreventDefault` | When true, the frontend listener calls event.preventDefault() before dispatching on every selector match. v0.27.5+: can also be a ConditionalPreventDefault object to fire only on specific key / button / modifier combinations (e.g. plain Enter on textarea while letting Shift+Enter through). Default: false. |
+| `stopPropagation?` | `boolean` | When true, the frontend listener calls event.stopPropagation() after dispatching, preventing host-side and other delegation listeners from also reacting. Default: false. |
+
+### DOMDelegatedEventData
+
+*Event data delivered to handlers registered via api.ui.dom.delegate(). Extends DOMEventData with a serialized snapshot of the matched element + modifier-key state + optional message context. v0.27.1+.*
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `matched` | `{ tagName, classList, dataset, attributes, textContent, id?, value?, checked?, selectedIndex?, selectedText?, label? }` | Snapshot of the element matched by event.target.closest(selector). May be an ancestor of the literal event.target. Form-input fields (value/checked/selectedIndex/selectedText/label) populated only for matching element types. label is the trimmed text of the first associated &lt;label&gt; (input / textarea / select only — explicit "for=" or implicit wrapping). |
+| `modifiers` | `{ ctrl, shift, alt, meta, button? }` | Modifier-key state at event time. button is populated for click events (0=left, 1=middle, 2=right). |
+| `message?` | `{ id, role, swipeId }` | Populated when the matched element is inside an assistant or user message. role: 'user' for [data-part="user"], 'assistant' otherwise. swipeId is the active swipe at dispatch time, resolved backend-side via the host's chat history. Falls through with 0 if the chat closed between event fire and dispatch or the message left the history. |
+| `(plus DOMEventData fields)` | `see DOMEventData` | Inherits type, targetId, targetValue, targetChecked, dataset, detail, clientX, clientY from DOMEventData (see above). |
+
 ### DOMHandle
 
 *Returned by api.ui.dom.inject() and api.ui.dom.injectAtMessage(). All methods are fire-and-forget.*
@@ -537,6 +593,8 @@
 | `detail?` | `unknown` | CustomEvent.detail (must be JSON-serializable). |
 | `clientX?` | `number` | Viewport X coordinate. Populated for MouseEvent / PointerEvent / contextmenu and from the first touch of a TouchEvent. Useful for positioning api.ui.showContextMenu at the cursor. |
 | `clientY?` | `number` | Viewport Y coordinate. Same event families as clientX. |
+| `key?` | `string` | KeyboardEvent.key — the value of the key pressed, modifier-aware ('Enter', 'Escape', 'a', 'A', 'ArrowUp', 'Shift'). Populated only for keydown / keyup / keypress events. Use this to distinguish e.g. Enter-to-submit on a text input. |
+| `code?` | `string` | KeyboardEvent.code — physical key on the keyboard, layout-independent ('Enter', 'KeyA' regardless of shift, 'ArrowUp', 'ShiftLeft'). Populated only for keydown / keyup / keypress events. Use this for physical-position bindings (e.g. WASD). |
 
 ### DOMListenOptions
 
@@ -544,7 +602,18 @@
 
 | Field | Type | Description |
 | --- | --- | --- |
-| `preventDefault?` | `boolean` | When true, the frontend listener calls event.preventDefault() synchronously before dispatching to the script handler. Must be set at registration time — the async worker-boundary dispatch returns too late to preventDefault from inside the handler body. Default: false. |
+| `preventDefault?` | `boolean | ConditionalPreventDefault` | When true, the frontend listener calls event.preventDefault() synchronously before dispatching to the script handler. Must be set at registration time — the async worker-boundary dispatch returns too late to preventDefault from inside the handler body. v0.27.5+: can also be a ConditionalPreventDefault object to fire only on specific key / button / modifier combinations. Default: false. |
+
+### ConditionalPreventDefault
+
+*Predicate-based preventDefault rule for DOMDelegateOptions / DOMListenOptions (v0.27.5+). Fires event.preventDefault() only when the event matches all provided filters (AND semantics). Each filter is optional; empty {} = always match (equivalent to `preventDefault: true`). Filters are evaluated synchronously frontend-side at fire time. Common shapes: { onKeys: ['Enter'], whenModifiers: { exclude: ['shift'] } } (plain Enter, not Shift+Enter); { onKeys: ['s', 'S'], whenModifiers: { require: ['ctrl'] } } (Ctrl+S override); { onButtons: [2] } (right-click only).*
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `onKeys?` | `string[]` | KeyboardEvent.key value(s) — OR-matched within the array. Non-keyboard events skipped (preventDefault does NOT fire) when this is set. |
+| `onCodes?` | `string[]` | KeyboardEvent.code value(s) — physical key, layout-independent. Same keyboard-only semantics as onKeys. Use for physical-position bindings (e.g. WASD). |
+| `onButtons?` | `number[]` | MouseEvent.button value(s) — 0=left, 1=middle, 2=right, 3=back, 4=forward. Non-mouse events skipped when set. |
+| `whenModifiers?` | `{ require?, exclude? }` | Modifier-key constraint. ALL of require must be held; NONE of exclude may be held. Values: shift / ctrl / alt / meta. Applies to KeyboardEvent and MouseEvent. |
 
 ### LLMMessage
 
@@ -553,7 +622,21 @@
 | Field | Type | Description |
 | --- | --- | --- |
 | `role` | `'system' | 'user' | 'assistant'` | Message sender role. |
-| `content` | `string` | Message text content. |
+| `content` | `string | LlmMessagePart[]` | Plain string (simple case) OR an array of parts. Parts let scripts thread native tool_use / tool_result payloads through an agentic loop instead of text-encoding them. Available since v0.29.0. |
+| `reasoning_content?` | `string` | Thinking-mode reasoning content from the previous assistant turn, echoed back on the next request. REQUIRED by DeepSeek thinking-mode models on tool-call continuations (the API returns 400 invalid_request_error: "The 'reasoning_content' in the thinking mode must be passed back to the API." without it). Plain-text continuations and non-thinking models don't need it. Other providers routing DeepSeek (NanoGPT, OpenRouter) inherit the requirement; providers without thinking mode ignore the field. Copy from LLMRawResult.reasoning_content after each generateWithTools call. Available since v0.30.2 / lumiverse-spindle-types ≥0.4.72. |
+
+### LlmMessagePart
+
+*A single content part inside an LLMMessage. Discriminated union — switch on the `type` field. Mirrors the host's LlmMessagePartDTO; available since v0.29.0 / lumiverse-spindle-types ≥0.4.71.*
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `{ type: 'text', text }` | `` | A plain text segment. |
+| `{ type: 'image', data, mime_type }` | `` | Base64-encoded image. Consumed only by connections whose model supports image input. |
+| `{ type: 'audio', data, mime_type }` | `` | Base64-encoded audio. Consumed only by connections whose model supports audio input. |
+| `{ type: 'tool_use', id, name, input }` | `` | A tool call the LLM is invoking. Re-pair with a matching tool_result in the next user turn (tool_result.tool_use_id === this.id). |
+| `{ type: 'tool_result', tool_use_id, content, is_error? }` | `` | Result of a tool call, paired by tool_use_id. Set is_error=true to signal failure (model adapts retry/abandon strategy). |
+| `cache_control? (all variants)?` | `` | Provider-specific cache hint (e.g. Anthropic ephemeral). Most callers leave undefined. |
 
 ### LLMOptions
 
@@ -591,15 +674,17 @@
 | --- | --- | --- |
 | `content` | `string` | Text generated by the LLM. Empty string when tool_calls is present. |
 | `tool_calls?` | `ToolCall[]` | Function calls requested by the LLM. When present, content is typically empty. |
+| `reasoning_content?` | `string` | Thinking-mode reasoning content from this turn. Present on tool-call iterations against DeepSeek-thinking models. Copy onto the assistant turn you append to history before the next call (set LLMMessage.reasoning_content). Other providers ignore it. Available since v0.30.2. |
 
-### LLMRawResultStructured&lt;T&gt;
+### LLMRawResultStructured
 
-*Return type of api.llm.generateWithTools(messages, tools, opts, schema). On intermediate steps only tool_calls is set. On the final step only content is set.*
+*Generic type `LLMRawResultStructured<T>`. Return type of `api.llm.generateWithTools(messages, tools, opts, schema)` — the structured-output overload. On intermediate steps only `tool_calls` is set. On the final step only `content` is set, typed as `T` (the schema-parsed result).*
 
 | Field | Type | Description |
 | --- | --- | --- |
-| `content?` | `T` | Final step: JSON-parsed and Zod-validated result typed as T. |
+| `content?` | `T` | Final step: JSON-parsed and Zod-validated result typed as T (the schema you passed as the 4th arg to generateWithTools). |
 | `tool_calls?` | `ToolCall[]` | Intermediate steps: function calls requested by the LLM. When present, content is absent. |
+| `reasoning_content?` | `string` | Thinking-mode reasoning content from this turn. Same semantics as LLMRawResult.reasoning_content — copy onto the next assistant turn for DeepSeek-thinking tool loops. Available since v0.30.2. |
 
 ### ToolCall
 
@@ -1448,6 +1533,106 @@
 | `filename?` | `string` | Optional filename — preserves the file extension when stored. |
 | `mimeType?` | `string` | Optional content type. Defaults to 'image/png' on the host side. |
 
+### DatabankScope
+
+***Enum**: `'global' | 'character' | 'chat'`. Activation scope for a databank. There are EXACTLY THREE values — there is no `'script'` scope. `'global'` is unscoped (available everywhere); `'character'` is keyed by a character UUID via `scopeId`; `'chat'` is keyed by a chat UUID via `scopeId`. `scopeId` is REQUIRED for `'character'` and `'chat'`, omitted (or null) for `'global'`. Scope cannot be changed after creation — pick the right one up front.*
+
+| Field | Type | Description |
+| --- | --- | --- |
+
+### DatabankDocumentStatus
+
+***Enum**: `'pending' | 'processing' | 'ready' | 'error'`. Ingestion lifecycle of an uploaded document. New uploads land as `'pending'` and progress through `'processing'` to `'ready'` (success) or `'error'` (terminal failure). `documents.getContent()` returns null for anything other than `'ready'`; `documents.waitUntilReady()` polls until ready and throws on `'error'` or timeout.*
+
+| Field | Type | Description |
+| --- | --- | --- |
+
+### DatabankInfo
+
+*Returned by api.databanks.get / findByName / create / update; entries inside list().*
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `id` | `string` | Databank ID. |
+| `name` | `string` | Display name. |
+| `description` | `string` | Free-form description; empty string if unset. |
+| `scope` | `DatabankScope` | Activation scope: 'global' \| 'character' \| 'chat'. |
+| `scopeId` | `string | null` | Owner key for 'character' (character UUID) or 'chat' (chat UUID) scopes. null for 'global'. |
+| `enabled` | `boolean` | Whether the databank participates in retrieval. |
+| `metadata` | `Record<string, unknown>` | Arbitrary metadata bag. |
+| `documentCount?` | `number` | Number of documents in the databank. May be omitted on bulk list responses for performance. |
+| `createdAt` | `number` | Creation timestamp (ms since epoch). |
+| `updatedAt` | `number` | Last-modified timestamp (ms since epoch). |
+
+### DatabankCreateInput
+
+*Passed to api.databanks.create(input). Validates host-side — invalid scope or missing scopeId rejects the call.*
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `name` | `string` | Display name for the new databank. |
+| `description?` | `string` | Free-form description. |
+| `scope` | `DatabankScope` | Activation scope. MUST be one of 'global' \| 'character' \| 'chat' — see DatabankScope. There is no 'script' scope. |
+| `scopeId?` | `string | null` | Owner key. REQUIRED when scope is 'character' or 'chat' (character UUID or chat UUID respectively). Omit (or pass null) when scope is 'global'. |
+
+### DatabankUpdateInput
+
+*Passed to api.databanks.update(databankId, input). Scope cannot be changed after creation — there are no scope/scopeId fields here on purpose.*
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `name?` | `string` | New display name. |
+| `description?` | `string` | New description. |
+| `enabled?` | `boolean` | Whether this databank participates in retrieval. |
+
+### DatabankDocumentInfo
+
+*Returned by api.databanks.documents.get / findByName / create / update / waitUntilReady; entries inside documents.list().*
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `id` | `string` | Document ID. |
+| `databankId` | `string` | Parent databank ID. |
+| `name` | `string` | Display name. |
+| `slug` | `string` | URL-safe slug derived from name. Regenerated on rename. |
+| `mimeType` | `string` | MIME type recorded at upload. |
+| `fileSize` | `number` | Size in bytes. |
+| `contentHash` | `string` | Content fingerprint (hash). Use to detect external content changes between uploads. |
+| `totalChunks` | `number` | Number of chunks the document was split into for embedding. |
+| `status` | `DatabankDocumentStatus` | Ingestion lifecycle: 'pending' \| 'processing' \| 'ready' \| 'error'. |
+| `errorMessage` | `string | null` | Human-readable error description when status is 'error'. null otherwise. |
+| `metadata` | `Record<string, unknown>` | Arbitrary metadata bag. |
+| `createdAt` | `number` | Upload timestamp (ms since epoch). |
+| `updatedAt` | `number` | Last-modified timestamp (ms since epoch). |
+
+### DatabankDocumentCreateInput
+
+*Passed to api.databanks.documents.create(databankId, input). Upload returns immediately with status='pending' — use waitUntilReady() to await ingestion. Max size 10 MB.*
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `data` | `string | Uint8Array` | Document content. string values are UTF-8 encoded internally; pass Uint8Array directly for already-binary sources. |
+| `filename` | `string` | Original filename including extension. Supported extensions: .txt .md .markdown .csv .tsv .json .xml .html .htm .yaml .yml .log .rst .rtf. |
+| `mimeType?` | `string` | Optional MIME type recorded on the document. Derived from filename extension when omitted. |
+| `name?` | `string` | Display name override. Defaults to filename minus the extension. |
+
+### DatabankDocumentUpdateInput
+
+*Passed to api.databanks.documents.update(documentId, input). The URL-safe slug regenerates automatically from the new name.*
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `name` | `string` | New display name. |
+
+### DatabankWaitUntilReadyOptions
+
+*Optional polling parameters for api.databanks.documents.waitUntilReady(documentId, options?). Throws on timeout, error status, or document deletion.*
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `timeoutMs?` | `number` | Max wait in ms. Default 60_000 (60s). Throws on timeout. |
+| `pollIntervalMs?` | `number` | Poll interval in ms. Default 500. |
+
 ---
 
 ## API Functions
@@ -1470,6 +1655,9 @@
 | `clearAllInjections` | — | Remove ALL injections across all scripts. |
 | `registerContentProcessor` | handler, options? | Register a handler that fires before a user-initiated message write hits SQLite. Returns a patch { content?, extra? } to transform what gets stored. Options: id, priority (default 100), origin filter, timeoutMs (default 2000). NOT invoked for api.chat.* mutations (loop safety). Returns handle { id, remove }. Requires chat_mutation. |
 | `listContentProcessors` | — | List all currently registered message content processors across all scripts. |
+| `setMessageHidden` | id, hidden | Mark a single message as hidden or visible. Hidden messages are excluded from vector retrieval but still included in prompt assembly. Toggle pattern: pass `true` to hide, `false` to unhide. Persists on the message — survives reloads. Requires chat_mutation permission. |
+| `setMessagesHidden` | ids, hidden | Bulk variant of `setMessageHidden`. Max 500 IDs per call. Same hidden-flag semantics (excluded from vector retrieval, still included in prompt assembly). Requires chat_mutation permission. |
+| `isMessageHidden` | id | Check whether a message is hidden. Returns false for messages that have never had the flag set (default state). Requires chat_mutation permission. |
 
 ### api.llm
 
@@ -1480,7 +1668,7 @@
 | `generateWithTools` | messages, tools, options?, schema? | Generate with tool schemas. Returns text or function calls for an agentic loop. |
 | `dryRun` | options? | Assemble the full prompt without calling the LLM. Returns messages, token counts, WI stats. |
 
-### api.variables.local / .global / .character
+### api.variables.local / .global / .character / .chat
 
 | Method | Arguments | Description |
 | --- | --- | --- |
@@ -1557,7 +1745,8 @@
 | `inject` | target, html, options? | Inject sanitized HTML at a CSS selector. Returns DOMHandle { id, update, remove, on }. Options: position (default "beforeend"), id (stable ID for idempotent injection). Requires app_manipulation. |
 | `injectAtMessage` | messageId, html, options? | Inject sanitized HTML into a message bubble. Waits up to 5 s for the element if not yet rendered. Options: position ("footer" default / "header"), id (stable ID). Returns DOMHandle. Requires app_manipulation. |
 | `addStyle` | css | Add a &lt;style&gt; element scoped to this script via @scope. Returns { remove() }. Use --lumiverse-* CSS variables for theming. Requires app_manipulation. |
-| `cleanup` | — | Remove all DOM injections and styles created by this script. Requires app_manipulation. |
+| `delegate` | selector, event, handler, options? | Attach an event-delegated listener at a known root, matching descendants by CSS selector. Lets scripts react to clicks/changes on DOM the script didn't inject — e.g. interactive elements emitted by the LLM in chat-message content. Single host-side capture listener per (root, event) tuple regardless of how many scripts subscribe; selector matching happens frontend-side via event.target.closest(). Default scope (options.root: "chat") restricts matching to chat content; "document" matches anywhere on the page. Returns an unsubscribe function. v0.27.1+. Requires app_manipulation. |
+| `cleanup` | — | Remove all DOM injections, styles, and delegations created by this script. Requires app_manipulation. |
 
 ### api.files — user* (per-user persistent)
 
@@ -1636,6 +1825,26 @@
 | `registerInterceptor` | handler, options? | Register a handler that runs BEFORE world info activation. Returns disable / enable / force / mutate decisions for the candidate entries. Returns handle { id, remove }. Multiple handlers compose by priority; vote-off precedence on disabled. 2s soft timeout (configurable). Requires generation. v0.27.0+. |
 | `listInterceptors` | — | Sync read of all currently-registered world-info interceptors. Diagnostic surface. Returns RegisteredWorldInfoInterceptorInfo[]. v0.27.0+. |
 
+### api.databanks
+
+| Method | Arguments | Description |
+| --- | --- | --- |
+| `list` | options? | List databanks (paginated). Options: limit, offset, scope, scopeId. Returns { data: DatabankInfo[], total }. Requires databanks permission. |
+| `get` | databankId | Get a databank by ID. Returns null if not found. Requires databanks permission. |
+| `findByName` | name, scope? | Find the first databank whose display name exactly matches (case-sensitive) within an optional scope. Convenience over list(). Returns null if no match. Requires databanks permission. |
+| `create` | input | Create a new databank. `input.scope` must be one of `'global' | 'character' | 'chat'` (DatabankScope) — `'script'` is NOT a valid scope. `scopeId` is REQUIRED for `'character'` and `'chat'` scopes; omit for `'global'`. Requires databanks permission. |
+| `update` | databankId, input | Update a databank (name / description / enabled). Scope cannot be changed after creation. Requires databanks permission. |
+| `delete` | databankId | Delete a databank and all its documents. Returns true if deleted. Requires databanks permission. |
+| `documents.list` | databankId, options? | List documents inside a databank (paginated). Returns { data: DatabankDocumentInfo[], total }. Requires databanks permission. |
+| `documents.get` | documentId | Get a document by ID. Returns null if not found. Requires databanks permission. |
+| `documents.findByName` | databankId, name | Find the first document whose display name exactly matches inside a databank. Returns null if no match. Requires databanks permission. |
+| `documents.create` | databankId, input | Upload a document. **Required input fields**: `data` (`string | Uint8Array` — NOT `content`) and `filename` (string with extension, e.g. `'notes.md'`). **Optional**: `mimeType`, `name` (display override). Returns immediately with `status: 'pending'` — ingestion (chunking + vectorisation) runs async. Use `waitUntilReady()` or poll `get()` to await completion. Max size 10 MB; supported extensions in DatabankDocumentCreateInput. Requires databanks permission. |
+| `documents.update` | documentId, input | Update document display name (URL slug regenerates). Requires databanks permission. |
+| `documents.delete` | documentId | Delete a document. Returns true if deleted. Requires databanks permission. |
+| `documents.getContent` | documentId | Read the document's ingested text content. Returns null if the document does not exist OR has not finished processing — check `status === 'ready'` via `get()` first, or call `waitUntilReady()` to block. Requires databanks permission. |
+| `documents.reprocess` | documentId | Reset a document to `status: 'pending'`, drop its vectors, and re-queue for full reingestion. Useful after upstream content changes or when ingestion errored. Requires databanks permission. |
+| `documents.waitUntilReady` | documentId, options? | Poll until the document reaches `status: 'ready'`. Throws on error/timeout/deletion. Default 60s timeout, 500ms poll interval — override via DatabankWaitUntilReadyOptions. Use after `create()` or `reprocess()` to await ingestion. Requires databanks permission. |
+
 ### api.personas
 
 | Method | Arguments | Description |
@@ -1649,6 +1858,22 @@
 | `delete` | personaId | Delete a persona. |
 | `switchActive` | personaId \| null | Switch the active persona. Pass null to deactivate. |
 | `getWorldBook` | personaId | Get the world book attached to a persona. |
+
+### api.presets
+
+| Method | Arguments | Description |
+| --- | --- | --- |
+| `list` | options? | List user presets (paginated). Options: `{ limit?, offset? }`. Defaults: limit 50, max 200. Returns `{ data: Preset[], total }`. Requires presets permission. |
+| `get` | presetId | Get a preset by ID. Returns `null` if not found. Requires presets permission. |
+| `create` | input | Create a new preset. `input.name` and `input.provider` are required (`provider` is typically `'loom'` for native Lumiverse presets). All other fields optional with host defaults (`engine: 'classic'`, empty parameters / prompt_order / prompts / metadata). Requires presets permission. |
+| `update` | presetId, input | Update a preset. All fields optional. When `prompt_order` or `metadata` is updated, Lumiverse prunes stale `metadata.promptVariables` entries that no longer correspond to a variable definition on a block. Requires presets permission. |
+| `delete` | presetId | Delete a preset. Returns `true` if deleted. Requires presets permission. |
+| `blocks.list` | presetId | Return the preset's ordered prompt blocks (`PromptBlock[]`), including structural category-marker blocks. Requires presets permission. |
+| `blocks.get` | presetId, blockId | Get a block by ID. Returns `null` if not found. Requires presets permission. |
+| `blocks.create` | presetId, input, options? | Create a prompt block. `options.index` inserts at a specific zero-based position within the preset's `prompt_order`; omitted appends to the end. Block ops update the parent preset's `prompt_order` array and trigger the normal preset update flow. Requires presets permission. |
+| `blocks.update` | presetId, blockId, input | Update a block. All fields except `id` are optional. Requires presets permission. |
+| `blocks.delete` | presetId, blockId | Delete a block. Returns `true` if deleted. Requires presets permission. |
+| `categories.list` | presetId | Return host-derived category groupings (`PromptBlockCategoryGroup[]`) for the preset's ordered blocks. Categories aren't separate records — they're structural prompt blocks with `marker === 'category'`, and a group's children are the following non-category blocks until the next category marker. The first group may have `categoryBlock: null` if normal blocks appear before any category marker. To create / update / delete a category, use `blocks.*` with `marker: 'category'`. Requires presets permission. |
 
 ### api.regexScripts
 
@@ -1696,6 +1921,15 @@
 | --- | --- | --- |
 | `emit` | event, payload? | Fire a named event to all subscribed handlers across all scripts. |
 | `on` | event, handler | Subscribe to a named event. Returns an unsubscribe function. |
+
+### api.rpc
+
+| Method | Arguments | Description |
+| --- | --- | --- |
+| `sync` | channel, value, options? | Publish the latest value on a channel for cross-extension consumption. Endpoints are auto-namespaced as `lumiscript.<scriptSlug>.<channel>` — `scriptSlug` auto-derives from the calling script's name, overridable via `options.as`. `options.policy` controls cross-extension permission delegation: omit for legacy "requester must hold every gated permission the owner has" guard, `{ requires: [] }` for public/narrow endpoints, `{ requires: ['name'] }` to scope delegated permissions explicitly. Returns the fully-qualified endpoint string. Free tier. Endpoints auto-unregister on script disable / delete / stale-after-re-run. |
+| `handle` | channel, handler, options? | Register an on-demand handler for a channel. Handler receives `RpcRequestContext { endpoint, requesterExtensionId, effectivePermissions }` and returns the response value (sync or async). `effectivePermissions` lists the gated permissions available to THIS delegated call per the endpoint's `options.policy`. Same `lumiscript.<scriptSlug>.<channel>` namespacing + `options.policy` semantics as `sync`. Returns the fully-qualified endpoint string. Free tier. |
+| `read` | endpoint | Read a value from another extension's published endpoint. Pass the full `<extensionId>.<channel>` path. Throws on missing endpoint. For cross-extension data sharing — use `api.broadcast` for in-extension pub/sub instead. |
+| `unregister` | channel, options? | Remove a channel previously published by the calling script via `sync` or `handle`. Idempotent — no-op if the channel isn't registered. Pass the same `options.as` you used at registration time if any. |
 
 ### api.commands
 
