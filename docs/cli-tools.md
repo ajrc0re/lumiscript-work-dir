@@ -1,10 +1,5 @@
 # CLI Tools
 
-Local note: this work directory vendors the relevant pack/unpack workflow under
-`tools/lumiscript-pack/`. Use `bun tools/lumiscript-pack/js2pack.ts ...` and
-`bun tools/lumiscript-pack/pack2js.ts ...` here. The `scripts/...` paths below
-describe the upstream LumiScript layout.
-
 LumiScript ships two command-line tools under `scripts/` for working with packs outside of the app:
 
 - **`pack2js`** — expands a `.lumiscript.zip` pack (or a bare `pack.json`) into a directory of individual `.js` files plus a `manifest.json`.

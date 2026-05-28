@@ -5,7 +5,8 @@ const STATUS_PICK_BUTTON_ID = "ls-gi-status-pick";
 const STATUS_ACTIVE_BUTTON_ID = "ls-gi-status-active";
 const STATUS_FORCE_BUTTON_ID = "ls-gi-status-force";
 const STATUS_RESTART_BUTTON_ID = "ls-gi-status-restart";
-const FLOAT_RESTART_BUTTON_ID = "ls-gi-floating-restart";
+const EXTERNAL_RESTART_BUTTON_ID = "ls-gi-external-restart";
+const EXTERNAL_RESTART_INJECTION_ID = "greeting-inspector-external-restart";
 const STATUS_AUTO_INJECT_CHECKBOX_ID = "ls-gi-status-auto-inject";
 const STATUS_DEBUG_CHECKBOX_ID = "ls-gi-status-debug";
 const STATUS_ACTION_EVENT = "greeting-inspector:status-action:v2";
@@ -34,11 +35,10 @@ const STATUS_ACTION_UNSUBSCRIBE_KEY =
 const STATUS_DRAWER_TAB_KEY = "__greetingInspectorStatusDrawerTab";
 const STATUS_DRAWER_CLICK_UNSUBSCRIBE_KEY =
   "__greetingInspectorStatusDrawerClickUnsubscribe";
-const FLOAT_RESTART_WIDGET_KEY = "__greetingInspectorFloatingRestartWidget";
-const FLOAT_RESTART_CLICK_UNSUBSCRIBE_KEY =
-  "__greetingInspectorFloatingRestartClickUnsubscribe";
-const FLOAT_RESTART_IN_FLIGHT_KEY =
-  "__greetingInspectorFloatingRestartInFlight";
+const EXTERNAL_RESTART_HANDLE_KEY = "__greetingInspectorExternalRestartHandle";
+const EXTERNAL_RESTART_CLICK_UNSUBSCRIBE_KEY =
+  "__greetingInspectorExternalRestartClickUnsubscribe";
+const RESTART_IN_FLIGHT_KEY = "__greetingInspectorRestartInFlight";
 const STATUS_STYLE_HANDLE_KEY = "__greetingInspectorStatusStyleHandle";
 const TRANSITION_IN_FLIGHT_KEY = "__greetingInspectorTransitionInFlight";
 const MANUAL_RUN_OVERRIDE_KEY = "__greetingInspectorManualRunOverride";
@@ -362,6 +362,7 @@ function isPreAssemblyGenerationStart() {
 function shouldCheckTransitionOnTrigger() {
   const eventName = getEventName();
   return (
+    isManualRun() ||
     TRANSITION_EVENTS.has(eventName) ||
     isChatContextRefresh() ||
     isActiveChatSettingChange() ||
@@ -373,6 +374,7 @@ function shouldCheckLatestMessageForTransition() {
   const eventName = getEventName();
 
   return (
+    isManualRun() ||
     LATEST_MESSAGE_TRANSITION_EVENTS.has(eventName) ||
     isActiveChatSettingChange()
   );
@@ -813,6 +815,12 @@ function buildUpcomingSelectorBodyHtml(
 
 function buildStatusCss() {
   return `
+@keyframes ls-gi-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .ls-gi-status {
   width: 100%;
   min-height: 100%;
@@ -890,6 +898,23 @@ function buildStatusCss() {
   cursor: pointer;
 }
 
+.ls-gi-status-button-inner {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+
+.ls-gi-status-spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 999px;
+  box-sizing: border-box;
+  animation: ls-gi-spin 0.8s linear infinite;
+}
+
 .ls-gi-status-active {
   background: var(--lumiverse-button-bg, rgba(255, 255, 255, 0.1));
   border-color: var(--lumiverse-border, rgba(255, 255, 255, 0.18));
@@ -897,6 +922,9 @@ function buildStatusCss() {
 
 .ls-gi-status-button:disabled {
   opacity: 0.45;
+  color: var(--lumiverse-text-muted, rgba(245, 245, 245, 0.72));
+  background: var(--lumiverse-bg-muted, rgba(255, 255, 255, 0.06));
+  border-color: var(--lumiverse-border, rgba(255, 255, 255, 0.14));
   cursor: not-allowed;
 }
 
@@ -984,55 +1012,31 @@ function buildStatusCss() {
   font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
 }
 
-.ls-gi-floating-restart-button {
-  width: 44px;
-  height: 44px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  color: var(--lumiverse-accent-text, #ffffff);
-  background: var(--lumiverse-accent, #3b82f6);
-  border: 1px solid var(--lumiverse-accent, #3b82f6);
-  border-radius: 999px;
-  box-sizing: border-box;
-  box-shadow: 0 14px 34px rgba(0, 0, 0, 0.38);
-  cursor: pointer;
+.ls-gi-external-restart {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 2147483646;
 }
 
-.ls-gi-floating-restart-button:hover {
-  filter: brightness(1.08);
-}
-
-.ls-gi-floating-restart-button:disabled {
-  opacity: 0.65;
-  cursor: wait;
-}
-
-.ls-gi-floating-restart-button svg {
-  width: 20px;
-  height: 20px;
-  pointer-events: none;
-}
 `;
 }
 
-function restartIconSvg() {
-  return `
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-      <path d="M21 12a9 9 0 0 1-15.5 6.2"/>
-      <path d="M3 12a9 9 0 0 1 15.5-6.2"/>
-      <path d="M18 3v5h-5"/>
-      <path d="M6 21v-5h5"/>
-    </svg>
-  `;
+function buildRestartButtonHtml(id, restartInFlight) {
+  const spinner =
+    restartInFlight ?
+      '<span class="ls-gi-status-spinner" aria-hidden="true"></span>'
+    : "";
+  const disabled = restartInFlight ? " disabled aria-busy=\"true\"" : "";
+
+  return `<button class="ls-gi-status-button ls-gi-status-active" id="${id}" type="button" title="Run Greeting Inspector as if the script was launched directly"${disabled}><span class="ls-gi-status-button-inner">${spinner}<span>Restart</span></span></button>`;
 }
 
-function buildFloatingRestartHtml(disabled = false) {
+function buildExternalRestartHtml(restartInFlight) {
   return `
-<button class="ls-gi-floating-restart-button" id="${FLOAT_RESTART_BUTTON_ID}" type="button" title="Restart Greeting Inspector" aria-label="Restart Greeting Inspector"${disabled ? " disabled" : ""}>
-    ${restartIconSvg()}
-  </button>
-`;
+<div class="ls-gi-external-restart">
+  ${buildRestartButtonHtml(EXTERNAL_RESTART_BUTTON_ID, restartInFlight)}
+</div>`;
 }
 
 function buildStatusHtml(
@@ -1042,6 +1046,7 @@ function buildStatusHtml(
   upcomingIndex,
   autoInject,
   debugEnabled,
+  restartInFlight = false,
 ) {
   const activeGreeting = greetings[activeIndex];
   const upcomingGreeting =
@@ -1089,7 +1094,7 @@ function buildStatusHtml(
   </div>
   <div class="ls-gi-status-control-box">
     <div class="ls-gi-status-control-row">
-      <button class="ls-gi-status-button ls-gi-status-active" id="${STATUS_RESTART_BUTTON_ID}" type="button" title="Run Greeting Inspector as if the script was launched directly">Restart</button>
+      ${buildRestartButtonHtml(STATUS_RESTART_BUTTON_ID, restartInFlight)}
       <label class="ls-gi-status-option" for="${STATUS_AUTO_INJECT_CHECKBOX_ID}">
         <input class="ls-gi-status-checkbox" id="${STATUS_AUTO_INJECT_CHECKBOX_ID}" type="checkbox"${autoInject ? " checked" : ""}>
         <span>Auto prompt</span>
@@ -1261,6 +1266,26 @@ function removeDrawerStatusClickHandler() {
   globalThis[STATUS_DRAWER_CLICK_UNSUBSCRIBE_KEY] = null;
 }
 
+function removeExternalRestartClickHandler() {
+  const previousUnsubscribe =
+    globalThis[EXTERNAL_RESTART_CLICK_UNSUBSCRIBE_KEY];
+
+  if (typeof previousUnsubscribe === "function") {
+    try {
+      previousUnsubscribe();
+    } catch {
+      // Listener cleanup is best-effort.
+    }
+  }
+
+  globalThis[EXTERNAL_RESTART_CLICK_UNSUBSCRIBE_KEY] = null;
+}
+
+function removeExternalRestartControl() {
+  removeExternalRestartClickHandler();
+  removeHandleByKey(EXTERNAL_RESTART_HANDLE_KEY);
+}
+
 function removeStatusActionHandler() {
   const previousUnsubscribe = globalThis[STATUS_ACTION_UNSUBSCRIBE_KEY];
 
@@ -1275,26 +1300,6 @@ function removeStatusActionHandler() {
   globalThis[STATUS_ACTION_UNSUBSCRIBE_KEY] = null;
 }
 
-function removeFloatingRestartClickHandler() {
-  const previousUnsubscribe = globalThis[FLOAT_RESTART_CLICK_UNSUBSCRIBE_KEY];
-
-  if (typeof previousUnsubscribe === "function") {
-    try {
-      previousUnsubscribe();
-    } catch {
-      // Listener cleanup is best-effort.
-    }
-  }
-
-  globalThis[FLOAT_RESTART_CLICK_UNSUBSCRIBE_KEY] = null;
-}
-
-function removeFloatingRestartControl() {
-  removeFloatingRestartClickHandler();
-  removeHandleByKey(FLOAT_RESTART_WIDGET_KEY);
-  globalThis[FLOAT_RESTART_IN_FLIGHT_KEY] = false;
-}
-
 async function replaceStatusStyle() {
   if (!api.ui.dom || !api.ui.dom.addStyle) {
     return;
@@ -1303,100 +1308,6 @@ async function replaceStatusStyle() {
   removeStatusStyle();
   globalThis[STATUS_STYLE_HANDLE_KEY] =
     await api.ui.dom.addStyle(buildStatusCss());
-}
-
-async function ensureFloatingRestartControl() {
-  if (
-    !api.ui ||
-    typeof api.ui.createFloatWidget !== "function" ||
-    !api.broadcast ||
-    typeof api.broadcast.emit !== "function"
-  ) {
-    return;
-  }
-
-  if (api.ui.dom && api.ui.dom.addStyle) {
-    await replaceStatusStyle();
-  }
-
-  let widget = globalThis[FLOAT_RESTART_WIDGET_KEY];
-
-  if (widget && widget.root && typeof widget.root.update === "function") {
-    try {
-      widget.root.update(
-        buildFloatingRestartHtml(
-          Boolean(globalThis[FLOAT_RESTART_IN_FLIGHT_KEY]),
-        ),
-      );
-      return;
-    } catch {
-      removeFloatingRestartControl();
-    }
-  }
-
-  try {
-    widget = await api.ui.createFloatWidget({
-      width: 44,
-      height: 44,
-      snapToEdge: true,
-      tooltip: "Restart Greeting Inspector",
-      chromeless: true,
-    });
-    widget.root.update(buildFloatingRestartHtml(false));
-  } catch (error) {
-    appendDebugLog("floating restart render failed", {
-      error: error && error.message ? error.message : String(error),
-    });
-    return;
-  }
-
-  globalThis[FLOAT_RESTART_WIDGET_KEY] = widget;
-  globalThis[FLOAT_RESTART_CLICK_UNSUBSCRIBE_KEY] = widget.root.on(
-    "click",
-    async (event) => {
-      if (event.targetId !== FLOAT_RESTART_BUTTON_ID) {
-        return;
-      }
-
-      if (globalThis[FLOAT_RESTART_IN_FLIGHT_KEY]) {
-        return;
-      }
-
-      globalThis[FLOAT_RESTART_IN_FLIGHT_KEY] = true;
-      widget.root.update(buildFloatingRestartHtml(true));
-      appendDebugLog("floating restart requested");
-
-      try {
-        await api.broadcast.emit(STATUS_ACTION_EVENT, {
-          action: "restart",
-        });
-      } catch (error) {
-        const message = error && error.message ? error.message : String(error);
-        appendDebugLog("floating restart failed", { error: message });
-        api.ui.toast(
-          `Greeting Inspector restart failed: ${message}`,
-          "warning",
-        );
-      } finally {
-        globalThis[FLOAT_RESTART_IN_FLIGHT_KEY] = false;
-
-        try {
-          const currentWidget = globalThis[FLOAT_RESTART_WIDGET_KEY];
-
-          if (
-            currentWidget &&
-            currentWidget.root &&
-            typeof currentWidget.root.update === "function"
-          ) {
-            currentWidget.root.update(buildFloatingRestartHtml(false));
-          }
-        } catch {
-          // If the host removed the widget during restart, the next render will recreate it.
-        }
-      }
-    },
-    { preventDefault: true },
-  );
 }
 
 function buildInactiveStatusHtml(message) {
@@ -1442,6 +1353,7 @@ async function removeStatusUi(
   message = "Open a chat with alternate greetings to use Greeting Inspector.",
 ) {
   removeStatusActionHandler();
+  removeExternalRestartControl();
 
   try {
     await clearStatusDrawerUi(message);
@@ -1453,7 +1365,7 @@ async function removeStatusUi(
 async function destroyStatusUi() {
   removeDrawerStatusClickHandler();
   removeStatusActionHandler();
-  removeFloatingRestartControl();
+  removeExternalRestartControl();
   removeStatusStyle();
 
   const tab = globalThis[STATUS_DRAWER_TAB_KEY];
@@ -1722,6 +1634,7 @@ function attachStatusClickHandler(
   autoInject,
   debugEnabled,
   chatId,
+  restartInFlight,
 ) {
   return handle.on("click", async (event) => {
     const targetId = event.targetId || "";
@@ -1734,6 +1647,10 @@ function attachStatusClickHandler(
     } else if (targetId === STATUS_FORCE_BUTTON_ID) {
       action = "force";
     } else if (targetId === STATUS_RESTART_BUTTON_ID) {
+      if (restartInFlight || globalThis[RESTART_IN_FLIGHT_KEY]) {
+        return;
+      }
+
       action = "restart";
     } else if (targetId === STATUS_AUTO_INJECT_CHECKBOX_ID) {
       autoInject =
@@ -1748,6 +1665,7 @@ function attachStatusClickHandler(
           upcomingIndex,
           autoInject,
           debugEnabled,
+          Boolean(globalThis[RESTART_IN_FLIGHT_KEY]),
         ),
       );
       action = "autoInject";
@@ -1764,6 +1682,7 @@ function attachStatusClickHandler(
           upcomingIndex,
           autoInject,
           debugEnabled,
+          Boolean(globalThis[RESTART_IN_FLIGHT_KEY]),
         ),
       );
       action = "debug";
@@ -1789,7 +1708,8 @@ async function renderStatusUi(
   debugEnabled,
   chatId,
 ) {
-  await ensureFloatingRestartControl();
+  const restartInFlight = Boolean(globalThis[RESTART_IN_FLIGHT_KEY]);
+
   await renderStatusDrawerUi(
     character,
     greetings,
@@ -1798,7 +1718,9 @@ async function renderStatusUi(
     autoInject,
     debugEnabled,
     chatId,
+    restartInFlight,
   );
+  await renderExternalRestartUi(restartInFlight, chatId);
 }
 
 async function renderStatusDrawerUi(
@@ -1809,6 +1731,7 @@ async function renderStatusDrawerUi(
   autoInject,
   debugEnabled,
   chatId,
+  restartInFlight,
 ) {
   let tab = null;
 
@@ -1853,6 +1776,7 @@ async function renderStatusDrawerUi(
         upcomingIndex,
         autoInject,
         debugEnabled,
+        restartInFlight,
       ),
     );
 
@@ -1875,6 +1799,7 @@ async function renderStatusDrawerUi(
       autoInject,
       debugEnabled,
       chatId,
+      restartInFlight,
     );
 
     await allowFireAndForgetApiToFlush();
@@ -1886,6 +1811,57 @@ async function renderStatusDrawerUi(
         "warning",
       );
     }
+  }
+}
+
+async function renderExternalRestartUi(restartInFlight, chatId) {
+  if (!api.ui || !api.ui.dom || typeof api.ui.dom.inject !== "function") {
+    return;
+  }
+
+  let handle = globalThis[EXTERNAL_RESTART_HANDLE_KEY];
+  const html = buildExternalRestartHtml(restartInFlight);
+
+  try {
+    if (handle && typeof handle.update === "function") {
+      try {
+        handle.update(html);
+      } catch {
+        removeExternalRestartControl();
+        handle = null;
+      }
+    }
+
+    if (!handle) {
+      handle = await api.ui.dom.inject("body", html, {
+        id: EXTERNAL_RESTART_INJECTION_ID,
+        position: "beforeend",
+      });
+      globalThis[EXTERNAL_RESTART_HANDLE_KEY] = handle;
+    }
+
+    removeExternalRestartClickHandler();
+    globalThis[EXTERNAL_RESTART_CLICK_UNSUBSCRIBE_KEY] = handle.on(
+      "click",
+      async (event) => {
+        if (event.targetId !== EXTERNAL_RESTART_BUTTON_ID) {
+          return;
+        }
+
+        if (restartInFlight || globalThis[RESTART_IN_FLIGHT_KEY]) {
+          return;
+        }
+
+        await api.broadcast.emit(STATUS_ACTION_EVENT, {
+          action: "restart",
+          chatId,
+        });
+      },
+      { preventDefault: true },
+    );
+  } catch (error) {
+    const message = error && error.message ? error.message : String(error);
+    appendDebugLog("external restart render failed", { error: message });
   }
 }
 
@@ -2189,13 +2165,14 @@ async function resolveTransitionSource() {
   });
 
   if (latestMessageAuthoritative) {
+    const expectedMessageId = transitionMessageId();
     appendDebugLog("checking latest message for transition", {
       event: eventName,
-      expectedMessageId: transitionMessageId(),
+      expectedMessageId,
     });
 
     const latestMessage = await getLatestChatMessageForTransition(
-      transitionMessageId(),
+      expectedMessageId,
       true,
     );
     const latestContent = chatMessageContent(latestMessage);
@@ -2215,10 +2192,16 @@ async function resolveTransitionSource() {
       ...latestMarkerDetails,
     });
 
-    if (eventMarkerDetails.marker && !latestMessage) {
+    if (
+      eventMarkerDetails.marker &&
+      (eventName === "GENERATION_ENDED" || eventName === "GENERATION_STOPPED")
+    ) {
       appendDebugLog("using event payload marker as fallback", {
         event: eventName,
-        reason: "latest message unavailable",
+        reason:
+          latestMessage ?
+            "latest message did not expose marker after retry"
+          : "latest message unavailable",
         sourceId: eventSourceId,
       });
       return {
@@ -3204,7 +3187,20 @@ function registerStatusActionHandler(
       const payloadChatId = asText(payload && payload.chatId);
 
       if (action === "restart") {
-        await restartGreetingInspector();
+        if (globalThis[RESTART_IN_FLIGHT_KEY]) {
+          return;
+        }
+
+        globalThis[RESTART_IN_FLIGHT_KEY] = true;
+        appendDebugLog("restart requested", { chatId: payloadChatId || chatId });
+        await repaint();
+
+        try {
+          await restartGreetingInspector();
+        } finally {
+          globalThis[RESTART_IN_FLIGHT_KEY] = false;
+        }
+
         return;
       }
 
@@ -3397,8 +3393,6 @@ async function main() {
     return;
   }
 
-  await ensureFloatingRestartControl();
-
   if (!manualRun && isActiveChatClose()) {
     await removeInjectedNote();
     await removeStatusUi();
@@ -3408,6 +3402,14 @@ async function main() {
 
   if (!manualRun && isChatSwitch() && triggeredChatId) {
     await removeInjectedNote();
+  }
+
+  if (
+    !manualRun &&
+    (isChatContextRefresh() || isActiveChatSettingChange())
+  ) {
+    removeStatusActionHandler();
+    removeDrawerStatusClickHandler();
   }
 
   const activeChat = await waitForActiveChat(triggeredChatId);
@@ -3424,15 +3426,14 @@ async function main() {
     return;
   }
 
-  if (!manualRun) {
-    if (triggeredChatId && triggeredChatId !== activeChat.id) {
-      if (isChatSwitch()) {
-        await removeInjectedNote();
-        await removeStatusUi(
-          "Greeting Inspector is waiting for the active chat to finish switching.",
-        );
-      }
-
+  if (!manualRun && triggeredChatId && triggeredChatId !== activeChat.id) {
+    if (isChatContextRefresh() || isActiveChatSettingChange()) {
+      appendDebugLog("continuing with settled active chat", {
+        event: eventName,
+        triggeredChatId,
+        activeChatId: activeChat.id,
+      });
+    } else {
       appendDebugLog("run skipped", {
         reason: "active chat mismatch",
         event: eventName,
@@ -3517,15 +3518,13 @@ async function main() {
   let autoInject = await readAutoInject();
   let debugEnabled = await readDebugEnabled();
 
-  if (!manualRun) {
-    const advancedState = await advanceActiveIndexIfSceneChanged(
-      activeIndex,
-      upcomingIndex,
-      greetings,
-    );
-    activeIndex = advancedState.activeIndex;
-    upcomingIndex = advancedState.upcomingIndex;
-  }
+  const advancedState = await advanceActiveIndexIfSceneChanged(
+    activeIndex,
+    upcomingIndex,
+    greetings,
+  );
+  activeIndex = advancedState.activeIndex;
+  upcomingIndex = advancedState.upcomingIndex;
 
   async function renderAndRegisterStatus() {
     debugEnabled = await readDebugEnabled();
@@ -3556,6 +3555,12 @@ async function main() {
     greetings,
     autoInject,
   );
+
+  if (manualRun && globalThis[RESTART_IN_FLIGHT_KEY]) {
+    globalThis[RESTART_IN_FLIGHT_KEY] = false;
+    appendDebugLog("restart render ready", { chatId: activeChat.id });
+  }
+
   await renderAndRegisterStatus();
 
   if (!manualRun) {

@@ -6,25 +6,22 @@ New event-delegation surface for reacting to user interactions with DOM that the
 
 Single host-side capture listener per `(root, event)` tuple regardless of how many scripts subscribe; selector matching happens FE-side via `event.target.closest()`. BE resolves the active `swipeId` from chat history before dispatching to the script handler. Gated by `app_manipulation` (same as the rest of `api.ui.dom.*`).
 
-
 ### Update 0.27.2
 
 `api.chat.inject`/`removeInjection`/`clearInjections`/`clearAllInjections` now fire `pushInjections()` so the `LumiScriptPanel`'s Active Injections section updates without waiting for a manual refresh. Wired via a new `onInjectionsChanged` callback on `APIBuildDeps`, parallel to the existing `onToolsChanged` seam.
-
 
 ### Update 0.27.3
 
 Added key/code/label fields to DOM event data
 
-
 ### Update 0.27.4
 
 `api.chat.sendMessage` can now trigger an LLM continuation immediately after the message lands: `await api.chat.sendMessage('Yes', { triggerGeneration: true });`, same effect as the user pressing Enter on an empty input bar
 
-
 ### Update 0.27.5
 
 1. Conditional `preventDefault` on DOM events. `DOMDelegateOptions.preventDefault` and `DOMListenOptions.preventDefault` now accept a `ConditionalPreventDefault` object in addition to the existing boolean, which fires `event.preventDefault()` only when the event matches specific key/button/modifier filters:
+
 ```js
 api.ui.dom.delegate('textarea', 'keydown', handler, {
   preventDefault: {
@@ -33,14 +30,15 @@ api.ui.dom.delegate('textarea', 'keydown', handler, {
   },
 });
 ```
-2. Script editor init-failure detection. The Monaco script editor now surfaces a friendly troubleshooting overlay if it either (a) fails to mount within 15 seconds, or (b) doesn't receive focus when you click into it. Previously the failure mode was completely silent, you'd see a blank editor with no clue what went wrong. The overlay includes state-specific remediation steps (Monaco CDN check for mount failures, Windows font cache fix for Firefox-specific input failures, etc.) and a Dismiss button if it false-positives.
 
+2. Script editor init-failure detection. The Monaco script editor now surfaces a friendly troubleshooting overlay if it either (a) fails to mount within 15 seconds, or (b) doesn't receive focus when you click into it. Previously the failure mode was completely silent, you'd see a blank editor with no clue what went wrong. The overlay includes state-specific remediation steps (Monaco CDN check for mount failures, Windows font cache fix for Firefox-specific input failures, etc.) and a Dismiss button if it false-positives.
 
 ### Update 0.28.0
 
 Diagnostics panel
 
 Settings -> Support -> View Diagnostics opens a modal with a runtime state snapshot organised by section:
+
 - LumiScript: version, minimum-host requirement, granted permissions
 - Script-runner subprocess: alive/heartbeat/restart count + last reason/memory/CPU time (queried from the child via IPC using standard Node-compat `process.memoryUsage()`/`process.cpuUsage()`)
 - Active context: chat/character/user/persona/preset resolution; flags the chat-open-but-character-missing race we patched in v0.23.3
@@ -48,12 +46,12 @@ Settings -> Support -> View Diagnostics opens a modal with a runtime state snaps
 - Storage: userStorage round-trip probe
 - Editor/Monaco: `document.fonts` state, blob-URL worker support, Monaco CDN reachability
 
-
 ### Update 0.29.0
 
 Native tool support
 
 `LLMMessage.content` widened to accept native `tool_use`/`tool_result` parts in addition to plain strings. Agentic-loop scripts can now thread tool calls through providers as first-class signals instead of text-encoded `[Tool: X]`/`[Result]: ...` pseudo-turns. Providers understand the parts shape natively, improving model adherence and reducing the chance of the model getting confused by its own scaffolding text.
+
 ```js
 api.tools.register('lookup_price', {
   display_name: 'Lookup Price',
@@ -145,7 +143,6 @@ api.tools.unregister('lookup_price');
 console.log('After unregister: ' + api.tools.list().length + ' tools');
 ```
 
-
 ### Update 0.30.0
 
 Meet Lisa, your in-app code assistant!
@@ -153,15 +150,18 @@ Meet Lisa, your in-app code assistant!
 LumiScript now ships with a built-in code assistant. Her name is Lisa, she lives inside the extension, and she knows the LumiScript API surface intimately.
 
 **Where to find her**
+
 - **LumiScript Settings -> Assistant -> Ask Lisa**
 - **Script editor topbar** - chat icon next to the Run button. One click from any open script
 
 **What she does well**
+
 - Answers questions about LumiScript APIs (the full `api.*` surface), built-in libraries (`ls:icons`, `ls:components`,  etc.)
 - Writes complete scripts to your spec
 - Looks up method signatures, type definitions, and permission requirements via her `lookup_api` tool, backed by a corpus index that's drift-validated at build time
 
 **Configurable from LumiScript Settings -> Assistant**
+
 - **Tool iterations** (default 8) - raise if Lisa hits the ceiling on hard questions; lower if your model thrashes
 - **Generation defaults** - temperature/top P/max tokens/parallel tool calls. Leave blank to inherit your connection's preset
 - **Reset** - one-click clear of all generation overrides
@@ -185,8 +185,6 @@ No new permissions required. Lisa runs entirely inside LumiScript using what the
 
 Be nice to her and let me know what works well and what doesn't!
 
-
-
 ### Update 0.30.1
 
 Adds a sixth section to the Diagnostics report covering Lisa
@@ -198,77 +196,158 @@ Adds a sixth section to the Diagnostics report covering Lisa
 - Generation defaults: info dump of any active overrides (temperature/top P/max tokens/parallel tool calls)
 - Tool iterations ceiling: info
 
-
 ### Update 1.0.0-rc.1
 
 The first release candidate for v1.0 is out. This is the big runtime-isolation rework: your scripts now run across a pool of supervised script-runner subprocesses (4 by default). The main guarantee: *one runaway script can no longer block any other script's execution.*
 
 **What's new for script authors**
 
-* Multi-worker dispatch. Scripts get assigned to one of worker subprocesses (configurable 1–16 in settings). Cross-worker handler routing through `api.broadcast` and `api.rpc` is automatic. If a subscriber lives on a different worker than the emitter, the host routes the call across processes for you. Memory pressure triggers LRU eviction; idle workers (30 min default) get torn down and respawned on demand.
-* Hot-reload-on-edit (opt-in). Add `// @ls:reload-on-edit` to the top of a script body and code edits re-run the body inside the same worker (~500ms debounce), refreshing the closures of registered handlers. The editor top bar's Reload button works regardless of the directive.
-* Lifecycle events, cleaner shape. `ls:startup` now fires both at LumiScript boot and on the disabled→enabled toggle. Symmetric partner to `ls:teardown` (which fires on disable/delete). Use `ls:startup` for tool registration, cache pre-warming, broadcast subscription setup, anything that needs to run whenever a script enters its running state.
-* Master toggle off cleans up everything. When you toggle LumiScript off via the master switch, all per-script registrations (tools, macros, RPC endpoints, DOM injections, modals, input-bar actions, float widgets, drawer tabs) get torn down for every enabled script. Previously only Spindle event subscriptions cleared, and the rest leaked until the extension fully reloaded.
-* Diagnostics panel, per-worker breakdown. Memory, eviction counts, script-to-worker assignments, IPC throughput, restart count + last reason. Useful for understanding what your scripts are actually doing.
+- Multi-worker dispatch. Scripts get assigned to one of worker subprocesses (configurable 1–16 in settings). Cross-worker handler routing through `api.broadcast` and `api.rpc` is automatic. If a subscriber lives on a different worker than the emitter, the host routes the call across processes for you. Memory pressure triggers LRU eviction; idle workers (30 min default) get torn down and respawned on demand.
+- Hot-reload-on-edit (opt-in). Add `// @ls:reload-on-edit` to the top of a script body and code edits re-run the body inside the same worker (~500ms debounce), refreshing the closures of registered handlers. The editor top bar's Reload button works regardless of the directive.
+- Lifecycle events, cleaner shape. `ls:startup` now fires both at LumiScript boot and on the disabled→enabled toggle. Symmetric partner to `ls:teardown` (which fires on disable/delete). Use `ls:startup` for tool registration, cache pre-warming, broadcast subscription setup, anything that needs to run whenever a script enters its running state.
+- Master toggle off cleans up everything. When you toggle LumiScript off via the master switch, all per-script registrations (tools, macros, RPC endpoints, DOM injections, modals, input-bar actions, float widgets, drawer tabs) get torn down for every enabled script. Previously only Spindle event subscriptions cleared, and the rest leaked until the extension fully reloaded.
+- Diagnostics panel, per-worker breakdown. Memory, eviction counts, script-to-worker assignments, IPC throughput, restart count + last reason. Useful for understanding what your scripts are actually doing.
 
 **This is an RC, please use it and report what breaks.** Structural work is done and stress-tested but real-world usage will surface things test scripts won't. If anything goes sideways, let me know.
-
-
 
 ### Update 1.0.0-rc.2
 
 **Cross-extension RPC permission delegation**
-* `api.rpc.sync()` and `api.rpc.handle()` accept a new `options.policy`:
+- `api.rpc.sync()` and `api.rpc.handle()` accept a new `options.policy`:
   - omit → legacy "requester inherits every owner permission" guard (default; backward-compatible — pre-RC2 callers see no change)
   - `{ requires: [] }` → readable without delegating any owner permissions; for intentionally narrow / public endpoints
   - `{ requires: ['name'] }` → both owner AND requester must hold the named permission; gated api.* calls inside the handler are limited to declared permissions
-* Handlers now receive `effectivePermissions: readonly string[]` on the `RpcRequestContext` — informational signal for handler logic; the host enforces the actual restriction
+- Handlers now receive `effectivePermissions: readonly string[]` on the `RpcRequestContext` — informational signal for handler logic; the host enforces the actual restriction
 
 **World Info events**
-* Four new Spindle events emitted on world-book mutations:
+- Four new Spindle events emitted on world-book mutations:
   - `WORLD_BOOK_CHANGED`: book created/updated/any entry mutation in this book/bulk-entry ops/reorder/imports
   - `WORLD_BOOK_DELETED`: book actually deleted
   - `WORLD_BOOK_ENTRY_CHANGED`: entry created or updated (not fired during bulk imports, subscribe to `WORLD_BOOK_CHANGED` in addition if you need to catch imported entries)
   - `WORLD_BOOK_ENTRY_DELETED`: entry actually deleted
-* New "World Info" event group in the editor; `WORLD_INFO_ACTIVATED` moved into it from Settings
+- New "World Info" event group in the editor; `WORLD_INFO_ACTIVATED` moved into it from Settings
 
 **`api.presets.*` generation preset CRUD**
-* Full CRUD over user generation presets via Spindle's new `spindle.presets.*` surface. A preset is the complete prompt configuration: sampler/provider parameters, ordered prompt blocks (with roles/positions/depth), prompt behavior settings, metadata
-* Three sub-namespaces:
+- Full CRUD over user generation presets via Spindle's new `spindle.presets.*` surface. A preset is the complete prompt configuration: sampler/provider parameters, ordered prompt blocks (with roles/positions/depth), prompt behavior settings, metadata
+- Three sub-namespaces:
   - `api.presets.*`: preset CRUD (list/get/create/update/delete)
   - `api.presets.blocks.*`: prompt-block CRUD within a preset (`create` accepts `options.index` for ordered insertion)
   - `api.presets.categories.*`: host-derived category grouping view (read-only; mutate categories via `blocks.*` with `marker: 'category'`)
-* Categories aren't separate records, they're structural prompt blocks with `marker === 'category'`, with following non-category blocks as children until the next category marker. `categoryMode` is `'radio'` (one enabled child) or `'checkbox'` (many)
-* Use cases: rotate prompt blocks based on chat context, toggle radio-category options on character state changes, snapshot presets to JSON for backup/share, build ephemeral per-chat presets and clean up via `ls:teardown`
-* Requires the new `presets` permission
+- Categories aren't separate records, they're structural prompt blocks with `marker === 'category'`, with following non-category blocks as children until the next category marker. `categoryMode` is `'radio'` (one enabled child) or `'checkbox'` (many)
+- Use cases: rotate prompt blocks based on chat context, toggle radio-category options on character state changes, snapshot presets to JSON for backup/share, build ephemeral per-chat presets and clean up via `ls:teardown`
+- Requires the new `presets` permission
 
 **Worker-isolation hardening**
-* `process.on('unhandledRejection', ...)` guard in the script-runner subprocess. Pre-RC2, a detached promise rejection inside a user-script body (canonically an un-awaited `(async () => { … })()` IIFE that awaits a rejecting api call) crashed the entire shared worker via Bun's default unhandled-rejection-exits-process behaviour. Co-located scripts' handler closures (macros, tools, broadcast subscriptions, RPC handlers) were orphaned in the auto-respawn, violating the v1.0 worker-isolation contract.
-* Survival strategy: log to backend stderr (audit trail) + attribute via WeakMap populated at the api-proxy's reject-call site + route to the originating script's editor console as an error entry. Worker stays alive; co-located scripts keep their registered handlers.
+- `process.on('unhandledRejection', ...)` guard in the script-runner subprocess. Pre-RC2, a detached promise rejection inside a user-script body (canonically an un-awaited `(async () => { … })()` IIFE that awaits a rejecting api call) crashed the entire shared worker via Bun's default unhandled-rejection-exits-process behaviour. Co-located scripts' handler closures (macros, tools, broadcast subscriptions, RPC handlers) were orphaned in the auto-respawn, violating the v1.0 worker-isolation contract.
+- Survival strategy: log to backend stderr (audit trail) + attribute via WeakMap populated at the api-proxy's reject-call site + route to the originating script's editor console as an error entry. Worker stays alive; co-located scripts keep their registered handlers.
 
 **Diagnostics panel enhancements**
-* New "Lumiverse backend version" + "Lumiverse frontend version" info rows in Section A, probed via Spindle's new `spindle.version.*` free-tier surface
-* "Minimum Lumiverse host version" row promoted from info to pass/warn based on `backend >= minimum` comparison
-* "Subprocess alive" message reframed to pool-aware ("Running — N workers alive")
-* Per-worker script assignments now visible as a hover tooltip on the Workers table's Scripts column AND as a new "Script assignments by worker" row (the latter carries through to the Markdown export so support reports include the breakdown)
+- New "Lumiverse backend version" + "Lumiverse frontend version" info rows in Section A, probed via Spindle's new `spindle.version.*` free-tier surface
+- "Minimum Lumiverse host version" row promoted from info to pass/warn based on `backend >= minimum` comparison
+- "Subprocess alive" message reframed to pool-aware ("Running — N workers alive")
+- Per-worker script assignments now visible as a hover tooltip on the Workers table's Scripts column AND as a new "Script assignments by worker" row (the latter carries through to the Markdown export so support reports include the breakdown)
 
 This is a release candidate, report any issues observed in real-world and just any Weird Shit™ in general
-
-
 
 ### Update 1.0.0-rc.3
 
 Two long-lived-script issues surfaced from hands-on testing after RC2's worker pool shipped:
-* **Eviction respects script registrations.** Workers hosting a script that registered a tool, macro, drawer tab, input bar action, RPC endpoint, world-info interceptor, content processor, macro interceptor, float widget, or advanced modal are now exempt from idle and memory eviction. Pre-fix, after 30 min idle the worker would be reaped and the registration would silently stop firing, where host-side it still looked alive but the handler closure had died with the worker.
-* **DOM handle re-attachment after worker respawn.** Scripts that re-inject DOM under the same `stableId` after their worker was evicted and respawned now correctly resolve to the same handle on both sides.
+- **Eviction respects script registrations.** Workers hosting a script that registered a tool, macro, drawer tab, input bar action, RPC endpoint, world-info interceptor, content processor, macro interceptor, float widget, or advanced modal are now exempt from idle and memory eviction. Pre-fix, after 30 min idle the worker would be reaped and the registration would silently stop firing, where host-side it still looked alive but the handler closure had died with the worker.
+- **DOM handle re-attachment after worker respawn.** Scripts that re-inject DOM under the same `stableId` after their worker was evicted and respawned now correctly resolve to the same handle on both sides.
 
 Diagnostics panel adds an "Eviction-exempt scripts (registrations)" row showing which scripts are pinning which workers and what kinds of registrations they hold.
-
-
 
 ### Update 1.0.0-rc.4
 
 Three anti-eviction pinning gaps surfaced from testing after RC3 shipped, now fixed:
-* **DOM event listeners now pin their worker.** Pre-rc.4 a script that injected an interactive UI element with `handle.on('click', ...)` event listeners but didn't also register a tool/macro/drawer tab was evictable. After the TTL the worker would die, the DOM stayed on screen, but clicks did nothing, as the click handler closures had died with the worker. Interactive UI now stays interactive across the idle threshold.
-* **Cross-script user-event broadcasts now pin too.** Scripts that subscribe to non-`ls:*` broadcasts emitted from other scripts need their worker alive to receive them. Pre-rc.4 the worker could die and forwarded broadcasts silently dropped. Engine-lifecycle `ls:*` subscriptions (e.g. `ls:startup`) are explicitly not counted, those only fire as side-effects of local activity, so they don't motivate keeping a worker warm.
-* **`DOMHandle.remove()` cleanup is now symmetric.** When a script removes a DOM element via `handle.remove()`, the event listeners attached to that element (and any descendants) are now properly cleaned up parent-side. Without this, the new pin signal would have accumulated orphan entries from removed elements, falsely keeping scripts pinned past their UI lifecycle.
+- **DOM event listeners now pin their worker.** Pre-rc.4 a script that injected an interactive UI element with `handle.on('click', ...)` event listeners but didn't also register a tool/macro/drawer tab was evictable. After the TTL the worker would die, the DOM stayed on screen, but clicks did nothing, as the click handler closures had died with the worker. Interactive UI now stays interactive across the idle threshold.
+- **Cross-script user-event broadcasts now pin too.** Scripts that subscribe to non-`ls:*` broadcasts emitted from other scripts need their worker alive to receive them. Pre-rc.4 the worker could die and forwarded broadcasts silently dropped. Engine-lifecycle `ls:*` subscriptions (e.g. `ls:startup`) are explicitly not counted, those only fire as side-effects of local activity, so they don't motivate keeping a worker warm.
+- **`DOMHandle.remove()` cleanup is now symmetric.** When a script removes a DOM element via `handle.remove()`, the event listeners attached to that element (and any descendants) are now properly cleaned up parent-side. Without this, the new pin signal would have accumulated orphan entries from removed elements, falsely keeping scripts pinned past their UI lifecycle.
+
+### Update 1.0.0-rc.5
+
+**New API surfaces**
+
+- `api.images.*`: persist image bytes to Lumiverse's image store. `upload(bytes)` and `uploadFromDataUrl(dataUrl)` both return an `ImageInfo` whose `id` is the canonical handle for `api.theme.extractColors`, character avatars, and databank document attachments. Requires the `images` permission.
+- `api.imageGen.*`: generate images against the user's configured image-gen connection profiles. `generate({prompt, ...})` returns `{imageDataUrl, imageId?, imageUrl?, model, provider}` — the `imageId` integrates cleanly with `api.images.*`, `api.theme.extractColors`, and `spindle.characters.setAvatar`. img2img/inpainting via `parameters.input_images: [imageId, ...]`. Provider/connection/model metadata via `getProviders`, `listConnections`, `getConnection`, `getModels` for dynamic parameter UIs. Requires the `image_gen` permission.
+- `api.oauth.*`: the only inbound-HTTP hook Spindle exposes. `onCallback(handler)` registers the redirect-URL handler (single handler per extension, last-wins, non-terminating warning on collisions), `getCallbackUrl()` returns the URL path for use as `redirect_uri`, `createState()` mints a CSRF nonce. Everything beyond these primitives (authorize-URL construction, token exchange, persistence) is script-owned — pair with `api.utils.http` and `api.enclave`. Requires the `oauth` permission.
+- `api.theme.*`: manipulate the Lumiverse theme from a script. `apply(overrides)` for raw CSS variable overrides + mode-keyed variants, `applyPalette({accent: hsl})` for host-generated coherent ~80-variable palettes, `extractColors(imageId)` to derive a palette from a stored image (pairs with `applyPalette`), `getCurrent()` to read the user's base theme, `generateVariables(config)` to compute the full variable map without applying, `clear()` to drop the script's contributions. Per-script attribution: multiple scripts can apply themes concurrently with per-key last-applied-wins. Auto-cleared on script disable. Requires the `app_manipulation` permission. Mutating calls auto-retry transparently if a non-committing macro resolution is in flight.
+
+**HTTP surface extension**
+
+`api.utils.http.*` now supports binary responses. `HttpRequestOptions.responseType: 'arraybuffer'` returns the response body as a `Uint8Array` instead of a string — pipes directly into `api.images.upload`, `api.utils.image.detectMime`, or `api.files.*`. LumiScript transparently decodes the host's base64 transport, so user scripts see raw bytes.
+
+**Regression fix: DOMHandle handler-fire**
+
+`DOMHandle.update/.remove/.makeDraggable/.injectChild` called from inside `handle.on(event, cb)` body silently no-oped. Root cause: the proxy used plain `dispatch` (no `targetHandle` in the IPC envelope) AND the host's `resolveActiveRun` denied `'context'`-source fallback even for persistent handles. The handler's transient activeRun was dropped before the IPC arrived, the request bailed with `RunCompletedError`, the proxy's `.catch(() => {})` swallowed the failure silently. Fix: proxy routes all DOMHandle methods through `dispatchOnHandle` with the persistent handle as the dispatch target; the host's fallback rule extended to allow `'context'` source on persistent handles.
+
+### Update 1.0.0-rc.6
+
+**State-sync-on-respawn for child-side caches**
+
+Closes the long-standing eviction-asymmetry issue that motivated the RC3 alias-storage hotfix. When the script-runner subprocess is evicted + respawned, the parent's DOM registry survives but the proxy's child-side stable-id cache (`domStableIdToElementId`) dies with the worker. Pre-RC6, the divergence was papered over by storing DOM handles under both the canonical id and the proxy's regenerated id: bounded alias accumulation per `stableId` × eviction cycle. RC6 ships the architecturally clean replacement: when the parent dispatches a script to a worker that hasn't seen it before (cold spawn/post-respawn/post-rebalance), it sends a `script-state-sync` IPC carrying the parent's view of the script's stable-id mappings BEFORE the run-script IPC. The proxy seeds its cache from the snapshot, so the proxy and parent agree on every elementId by construction. Bun's IPC is FIFO per channel, so ordering is guaranteed without an ack handshake. The RC3 alias-storage hotfix stays in place for one more release.
+
+**`DOMHandle.read(options?)`**
+
+Read-side parity for the DOM injection surface. `read()` returns a `SerializedDOMElement` snapshot of the handle's current state (`{ tag, attrs, text, childCount, html? }`) or `null` if the FE no longer has the element. The `html: true` option includes `innerHTML` for full-markup inspection. The snapshot descends past LumiScript's wrapper to return the user's element directly for single-root injections; falls back to the wrapper for multi-root or text-only content (with internal `data-ls-*` attributes stripped). First DOMHandle method that awaits an FE roundtrip, uses the same request-response correlation pattern as `api.ui.showContextMenu`. Throws `DomHandleReleasedError` after `.remove()` (matches sibling methods); resolves to `null` cleanly for the live-DOM-vanished race.
+
+**`api.scriptStorage`**
+
+Closes the "where does my script keep its session state?" UX gap. Per-script in-memory key/value store with six methods (`get<T>`/`set`/`delete`/`has`/`clear`/`keys`). Free tier, no permission required. Differentiates from `api.variables.local` (which is disk-persisted) by being explicitly session-scoped: survives worker eviction/respawn and script edits, cleared on script disable/delete, lost on full backend restart. 1 MB cap per script on the JSON-serialised total, throws cleanly with a migration hint to `api.variables.*` or `api.db.*` if a script needs storage at meaningful scale. Mutations fire `ls:scriptStorage:set`/`:delete`/`:clear` broadcasts, so debug + admin tooling can react without polling. Replaces the verbose `globalThis.__lumiscript_script_<scriptId>_*` convention; the convention continues to work for back-compat.
+
+**`api.ui.dom.cleanup()` cascade**
+
+Closes the explicit RC4 follow-up. Pre-RC6, calling `api.ui.dom.cleanup()` to bulk-tear-down a script's DOM mid-session left orphan entries in the parent's `handlerCleanups` map, its `unsub()` was a no-op (the FE listener was already gone) but the entry itself stayed, falsely inflating the eviction-pinning policy's `handlerClosures` count. RC6 adds a `dropAllDomListenerHandlersForScript` cascade in `handleDomCleanupRequest`, mirroring the rc.4 `DOMHandle.remove()` cascade but at script scope. Same `kind='domEventListener'`-only boundary, delegates remain explicit (selector-keyed reverse index TBD).
+
+### Update 1.0.0-rc.7
+
+**Audit-response RC**
+
+The quality + security audits landed. 11 of 13 quality findings closed; full security-audit closed.
+
+**Behavioural changes to know:**
+- `DOMHandle.update()`/`injectChild()` HTML is now DOMPurify-sanitised, inline event handlers (`onclick=…`, etc.) silently stripped, with a `[security]` note in the script's editor console. Migrate to `handle.on(event, fn)` event delegation.
+- `import()`, `require()`, `new Function()`, `.constructor.constructor`, literal `globalThis.Bun`, and literal `globalThis.process` are rejected at dispatch with a clear `[security]` console entry. `script.require('lib')` and method-style `obj.require(...)` continue to work.
+- `globalThis.process`/`globalThis.fetch` runtime access returns `undefined`.
+- `api.broadcast.emit` capped at 1 MB payload + 100/sec sustained (1000 burst) per script. Throws on cap with a migration hint to `api.db.*` for high-volume data.
+- Quality fixes: `api.json.merge` is now actually deep; `api.db.collection.find` matches by structural deep-equality (key-order independent, NaN-aware); `api.json.sort` sorts numbers numerically; `api.json.set/get` reject `__proto__`/`prototype`/`constructor` path segments.
+
+**Known residual:** aliased `globalThis.Bun`/`globalThis.process` access via `const g = globalThis; g.Bun…` still reaches the real value. Bun's `globalThis.Bun` is non-configurable (engine constraint); Spindle's runtime requires `process`. The proper closure is a true sandbox isolate (QuickJS-WASM or `ShadowRealm`), v1.1 spike planned.
+
+**Path to v1.0:** RC8 is docs, RC9 is reserved for any audit follow-ups, then GA
+
+### Update 1.0.0-rc.7.1
+
+Focused between-RC patch covering two regressions surfaced after RC7
+
+1. Startup blocker: Lumiverse's bundle scanner started matching Lisa corpus documentation strings (`Bun.write`, `process.env`) as if they were API calls, refusing extension startup with "blocked backend capabilities". Rephrased the matched REDIRECTS + cleaned related JSDoc and comments.
+2. Cross-run-orphan late-warn: `db.collection` factory calls surfaced spurious `RunCompletedError` at end-of-run when paired chat events fire body runs ~10 ms apart. Writes were unaffected (existing persistent handle fallback covered Collection handle method calls); bare factory calls had no targetHandle to trigger fallback. Extended `resolveActiveRun` to cover handle-returning factory calls producing persistent kinds.
+
+### Update 1.0.0-rc.7.2
+
+1. Declare `requested_capabilities: ["dynamic_code_execution"]` in spindle.json — covers Handlebars's `new Function("")` capability
+   probe used in template compilation. Did not declare `base64_decode`; refactored `base64ToUint8Array` from `Buffer.from(b64, 'base64')` to atob + char-code loop instead, following the docs' "only declare what you actually need" guidance.
+2. Add `atob` / `btoa` to `SAFE_GLOBALS` in `child-entry.ts`. Pure base64 codecs, zero capability surface, same shape as the already-whitelisted `TextEncoder`/`TextDecoder`. Library code feature-detects them (Zod's runtime detection etc.); the sandbox-escape test harness also depends on this for the new atob path.
+3. Bump `minimum_lumiverse_version` 0.9.7 -> 0.9.9 (`requested_capabilities` is a 0.9.9 addition)
+
+### Update 1.0.0-rc.8
+
+This is the docs-cycle RC - the full v1.0 documentation (modulo the cookbook and tutorials, which are still being worked on) ships in this release, plus 3 engine bug fixes.
+
+**Engine fixes**
+
+1. **Async handlers now work properly.** If you wrote `handle.on('click', async () => { ... })` with any `await api.X(...)` calls inside, they were silently dropped pre-RC8. The engine wrapper resolved before your handler finished. Now they work as you'd expect. Affects `DOMHandle.on`, input-bar actions, float widgets, drawer tabs, advanced modals.
+
+2. **Reload button now actually picks up your changes.** Pre-RC8, clicking Reload only wiped 5 of the 13 places scripts can register state — leftover DOM listeners, modals, widgets, and handlers from the previous body run kept firing alongside your fresh code. Now it's a full wipe + re-run; only `api.scriptStorage`, `api.theme.*` contributions, and the worker's `script.require()` cache survive across the reload. The "I changed my script, clicked Reload, but the changes don't take effect until I toggle the extension" workaround is no longer needed.
+
+3. **Active-context-aware reads inside long-lived handlers now see fresh values.** If your script registered a tool/modal/widget handler while character A was active, then character B becomes active, calls like `api.variables.character.get('x')` inside that handler now return character B's value, not character A's. Was snapshotted at registration time pre-RC8.
+
+**Docs**
+
+`docs/` ships in this release. 12 guides (DOM injection, LLM, macros, tools, broadcast, OAuth, theme, image gen, world info, databanks, persistent events, cross-extension RPC), 4 concepts files (trigger model, permissions, storage, handler lifetime), getting-started, an index.
+
+**Corpus**
+
+Lots of Lisa-corpus updates flowing from the docs cycle: Sandbox hardening section, Trigger model section, lifecycle-event cross-references on `ls:startup`/`ls:teardown`/`ls:reload`, async-method indication in cheat-sheet method tables.
+
+**Nothing should break.** No behavioural changes that affect existing scripts. The only thing users might notice as a delta is the Reload-button wipe doing more than it used to but the body re-runs immediately after, so any handlers you re-register come right back.
