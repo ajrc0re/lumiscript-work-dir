@@ -1,6 +1,79 @@
 # LumiScript Reference
 
-*Exported 2026-05-17*
+*Exported 2026-05-28*
+
+---
+
+## Trigger model
+
+**LumiScript does NOT use runtime event subscription.** There is no `api.on()`, no `api.events.on()`, no `api.subscribe()`, no `api.listen()`, no `api.triggers.on()` — and no, you don't write `event.on('message', handler)` either. None of those exist. **Do not lookup_api on any of them.** The paradigm is completely different from Node.js EventEmitter or DOM event listeners.
+
+**Event wiring is configured in the editor UI, not in the script source.** When you create or edit a script in LumiScript's script editor, an event-selector control lets you pick which Lumiverse events should run this script's body. There is no script-side syntax that subscribes — the wiring lives in the script's editor config, alongside its name, enabled flag, and binding.
+
+**`// @triggers EVENT_NAME[, ...]` in a script header is INFORMATIVE ONLY.** It's a comment convention you may write at the top of your script to document which events the script is *intended* to be wired to. The host does not parse it — writing `@triggers` has zero runtime effect. The actual events that fire your script come from the editor-UI wiring, not from this comment. (A future LumiScript version may add a programmatic-subscription API; current versions do not.)
+
+When a wired event fires, the **script body itself runs as the handler** — the entire body executes top-to-bottom with the event's payload available as the `data` global. No callback, no subscription object, no listener registry. `data.__event` carries the event name (e.g. `"MESSAGE_SENT"`); the rest of `data` is the event-specific payload (see the **Lumiverse Events** section for per-event payload shapes).
+
+```js
+// Optional documentary comment — has no effect on what triggers the script.
+// Actual wiring (e.g. "MESSAGE_SENT, MESSAGE_EDITED") is set in the editor UI.
+// @triggers MESSAGE_SENT, MESSAGE_EDITED
+
+// The body runs every time a wired event fires.
+// `data.__event` identifies which event triggered this invocation;
+// the rest of `data` is the event-specific payload.
+if (data.__event === 'MESSAGE_SENT') {
+  const score = await api.llm.generateStructured(/* ... */);
+  await api.databanks.documents.create('reviews-databank-id', {
+    data: JSON.stringify(score),
+    filename: `score-${data.message.id}.json`,
+  });
+}
+```
+
+The full list of available event names + their payload shapes + firing semantics is in the **Lumiverse Events** section below. To make a script react to one of those events, open it in the editor and select the event in the UI.
+
+**Execution isolation — every fire is a fresh function scope.** When a wired event fires, the host wraps your script body in a brand-new `AsyncFunction` and invokes it ONCE. Module-scope `let` / `const` / `var` declarations at the top of your script body are LOCAL to that one invocation — they do NOT survive to the next fire of the same script. A pattern like:
+
+```js
+let bankId = null;
+if (data.__event === 'ls:startup')  bankId = await ensureBank();
+if (data.__event === 'MESSAGE_SENT' && bankId) { /* ... */ }
+```
+
+...does NOT work. The `ls:startup` fire writes to `bankId` and returns; the function instance is discarded; the next `MESSAGE_SENT` fire is a fresh `AsyncFunction` invocation with its own brand-new `bankId = null`. The two fires share no local state.
+
+For state that needs to survive across fires, pick one of:
+
+- **`globalThis.<key>`** — process-scoped, persists for the lifetime of the script-runner subprocess (i.e. until the extension reloads). Cheapest option; ideal for in-memory caches. Example: `globalThis.lsScoringBankId ??= await ensureBank();`. (Note: globalThis values survive *editor saves* too — see the saved memory note about globalThis-cache-invalidation traps if you cache anything keyed on script identity.)
+- **`api.variables.{local,global,character,chat}`** — durable JSON-serialised stores with explicit scope semantics. Survives extension reloads.
+- **Registered handlers** (`api.broadcast.on(event, handler)`, `api.macros.register(...)`, `api.tools.register(...)`, `api.chat.registerContentProcessor(...)`, etc.) — these capture closures over the proxy and *do* survive across fires until the script is disabled or deleted. Useful for "subscriber-only" patterns where a script registers a handler in one fire and that handler fires later from a different source.
+
+**Common misconception**: "the local variable persists until the extension reloads." It does NOT. Each fire is its own scope. The boundary is per-fire, not per-extension-load.
+
+**Three similar-sounding systems, three different problems** — keep them straight:
+
+- **Editor-UI event wiring** — react to Lumiverse host *lifecycle* events (MESSAGE_SENT, GENERATION_ENDED, CHAT_CHANGED, ...). Configured per-script in the script editor.
+- `api.broadcast.*` — real-time *script-to-script* pub/sub between user scripts running inside the same LumiScript extension. Use for custom in-extension messaging.
+- `api.events.*` — *persistent log* of custom events (`track` / `query` / `replay` / `getLatestState`). Use for audit trails, state-resuming scripts, custom analytics. **NOT** for subscribing to host events.
+
+**Lifecycle events (`ls:startup` / `ls:teardown` / `ls:reload`).** Three LumiScript-synthetic events that mark script-state transitions. `ls:startup` fires on cold-boot entry into active state (extension boot OR disable→enable transition). `ls:teardown` fires on exit (disable / delete). `ls:reload` fires on hot in-place body refresh (autosave-with-`// @ls:reload-on-edit`-directive OR manual Reload button click). The first two are symmetric subscription events — opt in via the editor's event-picker checkbox. **`ls:reload` is the exception**: it is NOT in the picker — it fires deterministically as a side-effect of the Reload button (always) or the autosave directive (always, for scripts that declared it). Parallel to the Run button: a user action, not a subscription. The body re-runs on all three events; branch on `data.__event` to differentiate handling. **Reload also wipes per-script state** (DOM, modals, widgets, drawer tabs, handler closures, interceptors, injections, ...) BEFORE the body re-runs, while preserving `api.scriptStorage`, `api.theme.*` contributions, and the worker's `script.require()` cache — so an `ls:reload` body run lands into a clean slate equivalent to a fresh `ls:startup`. Use `if (data.__event === "ls:startup")` branches for code that should run EXCLUSIVELY on cold boot (default-config seeding, persistent-data migrations) — those fires once per active-state entry, not on every Reload click. To make init code re-run on both events, branch on `(data.__event === "ls:startup" || data.__event === "ls:reload")` or put it at the top of the body un-gated. v1.0.0-rc.8+ for the wipe semantics.
+
+**Sandbox hardening.** The script-runner sandbox locks down host capabilities that user scripts have no business reaching. Two layers gate this:
+
+- **Dispatch-time source check.** Scripts containing any of the following patterns are REJECTED before they run; the editor console shows a `[security]` entry naming the rejected pattern:
+  - `import('...')` / `await import('...')` — dynamic import. Use `script.require('library-name')` for inter-script dependencies (see the **Built-in Libraries** section).
+  - bare `require('...')` — CommonJS-style global require. Same migration: `script.require('library-name')`. Note: `script.require(...)` and method-style `obj.require(...)` are NOT rejected (the source check uses `(?<!\.)` lookbehind to exclude method access).
+  - `new Function('...')` / `Function('...')` — Function constructor. Define functions with normal syntax (`function foo() {}` / `const foo = () => {}`); same lookbehind exempts method-style `obj.Function(...)`.
+  - `.constructor.constructor` — prototype-chain access to the Function constructor.
+  - literal `globalThis.Bun` / `globalThis["Bun"]` — Bun runtime API. Use `api.utils.http.*` for HTTP, `api.files.*` (with `allowDangerous`) for filesystem.
+  - literal `globalThis.process` / `globalThis["process"]` — host process. Use `api.enclave.*` for secrets, never read host env vars from a script.
+
+- **Runtime globalThis lockdown.** At subprocess startup, every globalThis property not on the LumiScript allowlist is replaced with `undefined`. `typeof X` returns `'undefined'`; reading `X.method()` throws `TypeError`. Affects: `fetch`, `Worker`, `WebSocket`, `BroadcastChannel`, `XMLHttpRequest`, `EventSource`, `prompt`, `onerror`, `onmessage`, `postMessage`, `removeEventListener`, and Bun-specific Node-compat module globals (`fs`, `http`, `net`, `os`, `tls`, `vm`, `worker_threads`, `child_process`, `ffi`, `sqlite`, etc.). Standard ES built-ins (Object, Array, Promise, JSON, Math, Date, RegExp, Map, Set, etc.), timers (`setTimeout`, `setInterval`, `clearTimeout`, `clearInterval`, `queueMicrotask`, `structuredClone`), cancellation primitives (`AbortController`, `AbortSignal`), `crypto`, `WebAssembly`, `performance`, `Buffer`, base64 codecs (`atob`, `btoa`), web data carriers (Blob, File, FileReader, FormData, Headers, Request, Response), event types (Event, EventTarget, CustomEvent), and streams (ReadableStream/WritableStream/TransformStream) are all left accessible. The canonical list is `SAFE_GLOBALS` in `src/script-runner/child-entry.ts`.
+
+- **Layer-2 setTimeout/setInterval string-form rejection.** `setTimeout` and `setInterval` are whitelisted but monkey-patched to reject the string-form callback (the legacy `setTimeout('foo()', 100)` API that some runtimes still honour). Passing a string throws `TypeError: setTimeout requires a function callback (string form is not supported in the LumiScript sandbox)`. Always pass a function.
+
+**Console rate-limit.** Unhandled rejections from a single script are rate-limited to **10 per 60s window**; further rejections drop silently with a `"N additional rejection(s) were suppressed"` summary on the next-window rejection. Prevents a runaway loop from filling the editor console + backend stderr with millions of lines. The 10-per-minute cap is intentional — most legitimate scripts produce ≪ 1 rejection/minute under normal operation.
 
 ---
 
@@ -11,11 +84,11 @@
 | `ls:startup` | LumiScript | `{ __event: "ls:startup" }` |
 | `ls:teardown` | LumiScript | `{ reason: 'disabled' | 'deleted', scriptId, scriptName }` |
 | `ls:reload` | LumiScript | `{ reason: 'autosave' | 'manual', previousCodeHash, currentCodeHash, previousLength, currentLength, triggeredAt }` |
-| `MESSAGE_SENT` | Chat | `{ chatId, message }` |
-| `MESSAGE_EDITED` | Chat | `{ chatId, message }` |
+| `MESSAGE_SENT` | Chat | `{ chatId, message: ChatMessage }` |
+| `MESSAGE_EDITED` | Chat | `{ chatId, message: ChatMessage }` |
 | `MESSAGE_DELETED` | Chat | `{ chatId, messageId }` |
-| `MESSAGE_SWIPED` | Chat | `{ chatId, message, action, swipeId, previousSwipeId? }` |
-| `SWIPE_EDITED` | Chat | `{ chatId, message, previousSwipeId }` |
+| `MESSAGE_SWIPED` | Chat | `{ chatId, message: ChatMessage, action, swipeId, previousSwipeId? }` |
+| `SWIPE_EDITED` | Chat | `{ chatId, message: ChatMessage, previousSwipeId }` |
 | `CHARACTER_MESSAGE_RENDERED` | Chat | `{ chatId, messageId }` |
 | `USER_MESSAGE_RENDERED` | Chat | `{ chatId, messageId }` |
 | `GENERATION_STARTED` | Generation | `{ generationId, chatId, model }` |
@@ -23,21 +96,21 @@
 | `GENERATION_STOPPED` | Generation | `{ generationId, chatId, content }` |
 | `STREAM_TOKEN_RECEIVED` | Generation | `{ generationId, chatId, token }` |
 | `CHAT_CHANGED` | Entities | `{ chatId }` |
-| `CHAT_SWITCHED` | Entities | `{ chatId: string | null }  // null on return-to-home` |
-| `CHARACTER_EDITED` | Entities | `{ id, character }` |
+| `CHAT_SWITCHED` | Entities | `{ chatId: string | null }  // null on return-to-home — NO characterId on the payload` |
+| `CHARACTER_EDITED` | Entities | `{ id, character: Character }` |
 | `CHARACTER_DELETED` | Entities | `{ id }` |
 | `CHARACTER_DUPLICATED` | Entities | `{ id, newId }` |
-| `PERSONA_CHANGED` | Entities | `{ persona }` |
-| `WORLD_INFO_ACTIVATED` | World Info | `{ entries }` |
-| `WORLD_BOOK_CHANGED` | World Info | `{ id, worldBook }` |
+| `PERSONA_CHANGED` | Entities | `{ persona: Persona }` |
+| `WORLD_INFO_ACTIVATED` | World Info | `{ entries: WorldInfoEntry[] }` |
+| `WORLD_BOOK_CHANGED` | World Info | `{ id, worldBook: WorldInfo }` |
 | `WORLD_BOOK_DELETED` | World Info | `{ id }` |
-| `WORLD_BOOK_ENTRY_CHANGED` | World Info | `{ id, worldBookId, entry }` |
+| `WORLD_BOOK_ENTRY_CHANGED` | World Info | `{ id, worldBookId, entry: WorldInfoEntry }` |
 | `WORLD_BOOK_ENTRY_DELETED` | World Info | `{ id, worldBookId }` |
 | `SETTINGS_UPDATED` | Settings | `{ key, value }` |
 | `PRESET_CHANGED` | Settings | `{ presetId }` |
 | `CONNECTION_PROFILE_LOADED` | Settings | `{ connectionId }` |
-| `REGEX_SCRIPT_CHANGED` | Settings | `{ id, script: RegexScriptInfo }  // create / update / duplicate / reorder / enable / disable. v0.27.0+ — requires regex_scripts permission` |
-| `REGEX_SCRIPT_DELETED` | Settings | `{ id }  // v0.27.0+ — requires regex_scripts permission` |
+| `REGEX_SCRIPT_CHANGED` | Settings | `{ id, script: RegexScriptInfo }  // create / update / duplicate / reorder / enable / disable. Requires regex_scripts permission.` |
+| `REGEX_SCRIPT_DELETED` | Settings | `{ id }  // Requires regex_scripts permission.` |
 | `TOOL_INVOCATION` | Tools | `{ toolName, requestId, args }` |
 
 ---
@@ -122,6 +195,10 @@
 | `api.personas.*` | `personas` |
 | `api.presets.*` | `presets` |
 | `api.regexScripts.*` | `regex_scripts` |
+| `api.images.*` | `images` |
+| `api.imageGen.*` | `image_gen` |
+| `api.oauth.*` | `oauth` |
+| `api.theme.*` | `app_manipulation` |
 | `api.council.*` | free tier, read-only |
 
 ### Tools & Broadcast
@@ -141,6 +218,52 @@
 
 ---
 
+## Sandbox hardening
+
+The script-runner subprocess locks down host capabilities that user scripts have no business reaching. Two layers gate this — both are always on; there is no per-script opt-out. Cross-reference the `app_manipulation` and `cors_proxy` permissions in the **Permission Matrix** for how scripts opt in to specific surfaces that the sandbox otherwise denies.
+
+### Layer 1 — dispatch-time source check
+
+Scripts containing any of the patterns below are **rejected before they run**; the editor console shows a `[security]` entry naming the rejected pattern.
+
+| Pattern | Why | Use instead |
+| --- | --- | --- |
+| `import('...')` | Dynamic import lets scripts pull untrusted modules at runtime, bypassing every other check. | `script.require('library-name')` for inter-script libraries — see the Built-in Libraries section. |
+| `require('...')` | Bare CommonJS `require` would reach Node modules directly. | `script.require('library-name')`. Method-style access — `obj.require(...)` — is exempt via the source check's `(?<!\.)` lookbehind. |
+| `new Function('...') / Function('...')` | Runtime-constructed code bypasses the dispatch-time source check. | Normal function syntax: `function foo() {}` / `const foo = () => {}`. Method-style `obj.Function(...)` is exempt. |
+| `.constructor.constructor` | Prototype-chain path that reaches the Function constructor. | Same as above — define functions with normal syntax. |
+| `globalThis.Bun / globalThis["Bun"]` | Direct access to the Bun runtime API. | `api.utils.http.*` for HTTP, `api.files.*` (with `allowDangerous`) for filesystem. |
+| `globalThis.process / globalThis["process"]` | Direct access to the host process (env vars, exit, signals). | `api.enclave.*` for secrets, the `script.*` global for self-info. No script should ever read host env vars directly. |
+
+### Layer 2 — runtime `globalThis` lockdown
+
+At subprocess startup, every `globalThis` property NOT on the allowlist below is replaced with `undefined`. Reading a locked global returns `undefined` (so `typeof X === 'undefined'` evaluates naturally for feature-detect paths); reaching through to a method throws `TypeError: Cannot read properties of undefined`.
+
+| Category | Available globals |
+| --- | --- |
+| ES standard | `isNaN` `isFinite` `parseInt` `parseFloat` `NaN` `Infinity` `undefined` `encodeURI` `encodeURIComponent` `decodeURI` `decodeURIComponent` `escape` `unescape`&lt;br&gt;&lt;br&gt;*Standard ES global functions + value constants. Pure, no capability surface.* |
+| Core built-ins | `Object` `Array` `Number` `Boolean` `String` `Symbol` `Date` `RegExp` `Map` `Set` `WeakMap` `WeakSet` `WeakRef` `Promise` `Proxy` `Reflect` `JSON` `Math` `Intl` `BigInt` |
+| Typed arrays + binary | `ArrayBuffer` `SharedArrayBuffer` `DataView` `Atomics` `Int8Array` `Uint8Array` `Uint8ClampedArray` `Int16Array` `Uint16Array` `Int32Array` `Uint32Array` `Float16Array` `Float32Array` `Float64Array` `BigInt64Array` `BigUint64Array` |
+| Text + URL + base64 | `TextEncoder` `TextDecoder` `URL` `URLSearchParams` `URLPattern` `atob` `btoa`&lt;br&gt;&lt;br&gt;*Pure codecs and URL parsing — no I/O surface.* |
+| Binary data carriers | `Blob` `File` `FileReader` `FormData`&lt;br&gt;&lt;br&gt;*In-memory only; filesystem access still gated by `api.files.*` + `allowDangerous`.* |
+| HTTP message types | `Headers` `Request` `Response`&lt;br&gt;&lt;br&gt;*Structural types only. Outbound HTTP capability is `api.utils.http.*` (requires `cors_proxy` + `allowDangerous`).* |
+| Streams | `ReadableStream` `WritableStream` `TransformStream` `ByteLengthQueuingStrategy` `CountQueuingStrategy` `CompressionStream` `DecompressionStream` `TextEncoderStream` `TextDecoderStream`&lt;br&gt;&lt;br&gt;*Pure data transforms. The dangerous part of streams is what you READ FROM or PIPE TO; those endpoints are separately gated.* |
+| Web Crypto | `crypto` `Crypto` `CryptoKey` `SubtleCrypto`&lt;br&gt;&lt;br&gt;*Random bytes + `crypto.subtle.*` for signing / encryption. Also powers `api.utils.shortId` / `uuid`.* |
+| Async + timers | `setTimeout` `setInterval` `clearTimeout` `clearInterval` `queueMicrotask` `setImmediate` `clearImmediate` `structuredClone` `reportError`&lt;br&gt;&lt;br&gt;*String-form `setTimeout('code', ms)` is rejected at the wrapper — must pass a function.* |
+| Cancellation | `AbortController` `AbortSignal` |
+| Errors + iteration | `Error` `TypeError` `RangeError` `ReferenceError` `SyntaxError` `URIError` `EvalError` `AggregateError` `Iterator` `DisposableStack` `AsyncDisposableStack` `SuppressedError` |
+| Event types | `Event` `EventTarget` `CustomEvent` `MessageEvent` `ErrorEvent` `CloseEvent` `DOMException`&lt;br&gt;&lt;br&gt;*Pure data carriers, no capability.* |
+| Function constructor | `Function`&lt;br&gt;&lt;br&gt;*Whitelisted on architectural necessity — Zod's schema compiler and Handlebars' template compiler both invoke `new Function(...)`. The dispatch-time source check still rejects literal `new Function(...)` / `Function(...)` in user-script source as defence-in-depth.* |
+| Buffer | `Buffer`&lt;br&gt;&lt;br&gt;*Node-compat — user scripts can manipulate bytes; doesn't enable escape.* |
+| Performance + measurement | `performance` `Performance` `PerformanceEntry` `PerformanceMark` `PerformanceMeasure` `PerformanceObserver` `PerformanceObserverEntryList` `PerformanceResourceTiming` `PerformanceServerTiming` `PerformanceTiming` |
+| Realm + messaging | `ShadowRealm` `MessageChannel` `MessagePort`&lt;br&gt;&lt;br&gt;*`ShadowRealm` is whitelisted for experimentation; within a single subprocess `MessageChannel`/`MessagePort` can't reach anything dangerous.* |
+| Misc benign | `globalThis` `console` `navigator` `WebAssembly` `FinalizationRegistry` `HTMLRewriter` `BuildError` `BuildMessage` `ResolveError` `ResolveMessage`&lt;br&gt;&lt;br&gt;*`navigator` is the read-only Bun metadata object (`userAgent`, `platform`, etc.) — library code feature-detects via it. `console` is per-run shadowed for capture, but kept on the allowlist so the binding exists in the brief window before the per-run preamble.* |
+| Architectural necessity | `spindle` `process`&lt;br&gt;&lt;br&gt;*Both have known aliasing residuals documented in the security audit response. `spindle` is the host gateway — not present on the script-runner subprocess in production (only on the backend worker); whitelisted for test-infrastructure shape. `process` is whitelisted because Spindle's subprocess runtime uses the standard process lifecycle hooks internally; user-script access to bare `process` is closed by AsyncFunction parameter shadowing (Layer 1) and the dispatch-time source check (Layer 4).* |
+
+Notable globals that are *not* on the allowlist (representative, not exhaustive): `fetch` (use `api.utils.http.*`), `Worker`, `WebSocket`, `EventSource`, `BroadcastChannel`, `XMLHttpRequest`, browser dialogs (`alert` / `prompt` / `confirm`), and Node-compat module globals reached via `globalThis` (`fs`, `http`, `net`, `tls`, `vm`, `worker_threads`, `child_process`, `sqlite`, etc.). The canonical list of accessible globals is `SAFE_GLOBALS` in `src/script-runner/child-entry.ts`.
+
+---
+
 ## LumiScript Events
 
 | Event | Payload fields | Emitted by |
@@ -156,6 +279,9 @@
 | `ls:collection:updated` | `{ name, scope, scriptId, count, filterKind: 'all' | 'object' | 'fn' }` | collection.update() (only when count &gt; 0) |
 | `ls:collection:deleted` | `{ name, scope, scriptId, count, filterKind }` | collection.delete() / clear() (clear emits count=-1) |
 | `ls:collection:size-warning` | `{ name, scope, scriptId, bytes }` | auto — collection exceeds 10 MB soft threshold |
+| `ls:scriptStorage:set` | `{ scriptId, key, value }` | api.scriptStorage.set() |
+| `ls:scriptStorage:delete` | `{ scriptId, key }` | api.scriptStorage.delete() (only when the key existed) |
+| `ls:scriptStorage:clear` | `{ scriptId }` | api.scriptStorage.clear() / auto-cleanup on script disable / delete (only when the script HAD entries) |
 
 *The `ls:` prefix is reserved for LumiScript engine events. Use any other name for custom events between scripts.*
 
@@ -211,7 +337,7 @@ LumiScript **runtime directives** are special comments that change how the runti
 | `metadata?` | `Record<string, unknown>` | Arbitrary metadata attached to the message. |
 | `swipeId` | `number` | Index of the active swipe variant. 0 when the message has no alternates. |
 | `swipes` | `string[]` | All swipe variants. swipes[swipeId] equals content. |
-| `swipeDates` | `number[]` | Per-swipe creation timestamps (unix epoch seconds), aligned with swipes. Empty array on older hosts (pre-spindle-types 0.4.27). |
+| `swipeDates` | `number[]` | Per-swipe creation timestamps (unix epoch seconds), aligned with swipes. |
 | `extra` | `Record<string, unknown>` | Host-maintained bag: reasoning text/duration, attachments, hidden flag, etc. Keys depend on host build — treat as opaque. Empty object on older hosts. |
 
 ### GetMessagesOptions
@@ -231,12 +357,12 @@ LumiScript **runtime directives** are special comments that change how the runti
 | --- | --- | --- |
 | `role?` | `'user' | 'assistant' | 'system'` | Sender role. Default 'user'. |
 | `metadata?` | `Record<string, unknown>` | Arbitrary metadata to attach. |
-| `triggerGeneration?` | `boolean` | When true, the host triggers a normal LLM continuation after the message is appended (full preset / persona / world info / regex / character card / streaming pipeline — same as the user pressing Enter on an empty input bar). Use for click-to-respond UIs where the script wants the LLM to immediately reply to its appended message. Requires Lumiverse host &gt;= 0.9.x with triggerGeneration support (lumiverse-spindle-types &gt;= 0.4.66); silently ignored on older hosts. v0.27.4+. |
-| `generation?` | `ChatGenerationOptions` | Per-call overrides for the triggered generation (connection / persona / preset / parameters / target character / council retention). Only consulted when triggerGeneration is true; silently ignored otherwise. Each field is optional and falls through to the active chat's defaults when omitted. v0.27.4+. |
+| `triggerGeneration?` | `boolean` | When true, the host triggers a normal LLM continuation after the message is appended (full preset / persona / world info / regex / character card / streaming pipeline — same as the user pressing Enter on an empty input bar). Use for click-to-respond UIs where the script wants the LLM to immediately reply to its appended message. |
+| `generation?` | `ChatGenerationOptions` | Per-call overrides for the triggered generation (connection / persona / preset / parameters / target character / council retention). Only consulted when triggerGeneration is true; silently ignored otherwise. Each field is optional and falls through to the active chat's defaults when omitted. |
 
 ### ChatGenerationOptions
 
-*Per-call generation overrides for api.chat.sendMessage(content, { triggerGeneration: true, generation: ... }). Mirrors the host's ChatAppendGenerationOptionsDTO 1:1 in camelCase. Each field is optional; omitted fields fall through to the active chat's resolved defaults (same as a manual UI generation). Use this when a tool script needs to deviate from the user's normal chat configuration for a single triggered generation. v0.27.4+.*
+*Per-call generation overrides for api.chat.sendMessage(content, { triggerGeneration: true, generation: ... }). Mirrors the host's ChatAppendGenerationOptionsDTO 1:1 in camelCase. Each field is optional; omitted fields fall through to the active chat's resolved defaults (same as a manual UI generation). Use this when a tool script needs to deviate from the user's normal chat configuration for a single triggered generation.*
 
 | Field | Type | Description |
 | --- | --- | --- |
@@ -308,13 +434,13 @@ LumiScript **runtime directives** are special comments that change how the runti
 | `messageId?` | `string` | Undefined for 'create' origins (the row doesn't exist yet). |
 | `content` | `string` | Current content (already transformed by any earlier processors in the chain). |
 | `extra?` | `Record<string, unknown>` | Current extra map (initial.extra + delta-so-far from prior processors). Threaded through the chain even on swipe origins. |
-| `origin` | `'create' | 'update' | 'swipe_add' | 'swipe_update' | 'render'` | Which path triggered this invocation. 'create' includes auto-greetings. 'render' (host ≥0.9.7) fires on per-message display rendering — non-persisting, fires often, returned extra ignored. |
+| `origin` | `'create' | 'update' | 'swipe_add' | 'swipe_update' | 'render'` | Which path triggered this invocation. 'create' includes auto-greetings. 'render' fires on per-message display rendering — non-persisting, fires often, returned extra ignored. |
 | `swipeIndex?` | `number` | Set for 'swipe_update' only — zero-based index of the swipe being rewritten. |
 | `userId` | `string` | Owning user id for the write. |
 
 ### MessageContentProcessorResult
 
-*Return value of a registerContentProcessor handler. Return undefined / void to pass through, or a partial patch. content replaces the stored content. extra shallow-merges into existing — keys you omit are PRESERVED. extra is IGNORED on swipe origins (swipes share the parent message's extra) and on 'render' (no row to mutate; host ≥0.9.7). Return ONLY keys you mutated; pristine initial.extra keys are NOT round-tripped to avoid re-stamping unchanged keys on every write.*
+*Return value of a registerContentProcessor handler. Return undefined / void to pass through, or a partial patch. content replaces the stored content. extra shallow-merges into existing — keys you omit are PRESERVED. extra is IGNORED on swipe origins (swipes share the parent message's extra) and on 'render' (no row to mutate). Return ONLY keys you mutated; pristine initial.extra keys are NOT round-tripped to avoid re-stamping unchanged keys on every write.*
 
 | Field | Type | Description |
 | --- | --- | --- |
@@ -547,18 +673,18 @@ LumiScript **runtime directives** are special comments that change how the runti
 
 ### DOMDelegateOptions
 
-*Options for api.ui.dom.delegate(selector, event, handler, options?). v0.27.1+.*
+*Options for api.ui.dom.delegate(selector, event, handler, options?).*
 
 | Field | Type | Description |
 | --- | --- | --- |
 | `root?` | `'chat' | 'document'` | Where to attach the actual host-side capture listener. 'chat' (default): restricts matching to chat content; matches descendants of [data-message-id]. 'document': matches anywhere in the page (including Lumiverse's own UI surfaces). Both gate on app_manipulation. |
 | `messageId?` | `string` | Limit matching to a specific message id. Has no effect when root is "document". |
-| `preventDefault?` | `boolean | ConditionalPreventDefault` | When true, the frontend listener calls event.preventDefault() before dispatching on every selector match. v0.27.5+: can also be a ConditionalPreventDefault object to fire only on specific key / button / modifier combinations (e.g. plain Enter on textarea while letting Shift+Enter through). Default: false. |
+| `preventDefault?` | `boolean | ConditionalPreventDefault` | When true, the frontend listener calls event.preventDefault() before dispatching on every selector match. Can also be a ConditionalPreventDefault object to fire only on specific key / button / modifier combinations (e.g. plain Enter on textarea while letting Shift+Enter through). Default: false. |
 | `stopPropagation?` | `boolean` | When true, the frontend listener calls event.stopPropagation() after dispatching, preventing host-side and other delegation listeners from also reacting. Default: false. |
 
 ### DOMDelegatedEventData
 
-*Event data delivered to handlers registered via api.ui.dom.delegate(). Extends DOMEventData with a serialized snapshot of the matched element + modifier-key state + optional message context. v0.27.1+.*
+*Event data delivered to handlers registered via api.ui.dom.delegate(). Extends DOMEventData with a serialized snapshot of the matched element + modifier-key state + optional message context.*
 
 | Field | Type | Description |
 | --- | --- | --- |
@@ -569,15 +695,17 @@ LumiScript **runtime directives** are special comments that change how the runti
 
 ### DOMHandle
 
-*Returned by api.ui.dom.inject() and api.ui.dom.injectAtMessage(). All methods are fire-and-forget.*
+*Returned by api.ui.dom.inject() and api.ui.dom.injectAtMessage(). Most methods are fire-and-forget; the exception is `read(options?)` which is async (it awaits a frontend roundtrip).*
 
 | Field | Type | Description |
 | --- | --- | --- |
 | `id` | `string` | Unique element ID (generated or from stable ID). |
-| `update(html)` | `void` | Replace the inner HTML of the injected element. |
+| `update(html)` | `void` | Replace the inner HTML of the injected element. Sanitised via DOMPurify on the same FORBID_TAGS config as `api.ui.dom.inject` (`iframe` / `frame` / `object` / `embed` / `form` + default `on*` / `formaction` / `srcdoc` / `javascript:` strip). DOMPurify blocks XSS-via-tag-injection, but is not a substitute for thinking about trust — be deliberate about LLM-generated or externally-fetched HTML. |
 | `remove()` | `void` | Remove the element from the DOM and detach all listeners. |
-| `on(event, handler, options?)` | `() => void` | Attach a DOM event listener. Handler receives DOMEventData. Pass { preventDefault: true } to suppress the browser default synchronously (e.g. to block the native context menu on right-click). Returns an unsubscribe function. |
+| `on(event, handler, options?)` | `() => void` | Attach a DOM event listener. Handler receives DOMEventData. Pass { preventDefault: true } to suppress the browser default synchronously (e.g. to block the native context menu on right-click). Returns an unsubscribe function. **For handlers that do async work, make the handler `async` and `await` everything** — the host keeps the per-fire activeRun alive across the handler's await chain, so dispatches inside the awaited chain land cleanly. A SYNC handler that kicks off async work fire-and-forget (e.g. `(ev) => { doAsync(); }` with no `await`) returns `undefined` immediately, the activeRun closes, and any `api.*` calls the lingering async work tries to make fail with `RunCompletedError: late api call … runIdSource=context`. Write `async (ev) => { await doAsync(); }` instead. |
 | `makeDraggable(handleSelector?)` | `void` | Enable frontend-only drag. Optional CSS selector picks a drag handle child; the root element moves. Without a selector, the whole element is draggable. |
+| `injectChild(target, html, options?)` | `DOMHandle` | Inject HTML as a descendant of this handle's bound element. Target selector resolved RELATIVE to this element via the backend's element-map ref. Use when the parent may be orphaned at inject time (drawer tabs, modal bodies pre-mount). Sanitised via DOMPurify on the same FORBID_TAGS config as `api.ui.dom.inject` (`iframe` / `frame` / `object` / `embed` / `form` + default `on*` / `formaction` / `srcdoc` / `javascript:` strip). |
+| `read(options?)` | `Promise<SerializedDOMElement | null>` | Read a snapshot of this element's current DOM state (tag, attrs, text, childCount, optionally innerHTML). Returns `null` when the FE no longer has the element (host shell tore down a parent, etc.). Throws DomHandleReleasedError if the handle was already removed (`.remove()` or `api.ui.dom.cleanup()`). Async — uses the same request-response IPC pattern as api.ui.showContextMenu. Common uses: verify an injection rendered as expected, inspect script-controlled widget state, walk markup via `{ html: true }`. For form-control live values use `delegate(selector, 'input', ...)` instead — `.value` is a DOM property, not an attribute. |
 
 ### DOMEventData
 
@@ -602,11 +730,35 @@ LumiScript **runtime directives** are special comments that change how the runti
 
 | Field | Type | Description |
 | --- | --- | --- |
-| `preventDefault?` | `boolean | ConditionalPreventDefault` | When true, the frontend listener calls event.preventDefault() synchronously before dispatching to the script handler. Must be set at registration time — the async worker-boundary dispatch returns too late to preventDefault from inside the handler body. v0.27.5+: can also be a ConditionalPreventDefault object to fire only on specific key / button / modifier combinations. Default: false. |
+| `preventDefault?` | `boolean | ConditionalPreventDefault` | When true, the frontend listener calls event.preventDefault() synchronously before dispatching to the script handler. Must be set at registration time — the async worker-boundary dispatch returns too late to preventDefault from inside the handler body. Can also be a ConditionalPreventDefault object to fire only on specific key / button / modifier combinations. Default: false. |
+
+### DOMReadOptions
+
+*Options bag for DOMHandle.read(options?). All fields optional — `read()` with no argument returns a baseline snapshot.*
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `html?` | `boolean` | Also include `innerHTML` in the returned snapshot. Default false — keeps the IPC payload small for the common case (verify attrs, check text content). Set true when the script needs to traverse the descendant markup (e.g. parse a rendered subtree via DOMParser). |
+
+### SerializedDOMElement
+
+*Snapshot returned by DOMHandle.read(). Frontend-built serialization of the element bound to the handle.
+
+Which element gets snapshotted depends on the shape of what the script injected: for the common single-root case the user's root element is returned directly (e.g. `inject('<button class="x">Hi</button>')` → `tag: 'button'`); for multi-root or text-only content the snapshot falls back to LumiScript's wrapper (`tag: 'div'`, accurate `childCount`). Either way, internal `data-ls-*` and `data-spindle-ext` wrapper attributes are stripped from the `attrs` map.
+
+Deliberate omissions: computed styles, bounding rect, recursive child snapshots, property snapshots (`.value` / `.checked`). Form-control live values can be read via `delegate(selector, 'input', ...)` event handlers; for deep markup traversal, request `{ html: true }` and parse client-side.*
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `tag` | `string` | Lowercase tag name (e.g. 'div', 'button'). |
+| `attrs` | `Record<string, string>` | All attributes set on the element, keyed by lowercased attribute name. Includes class, id, style, data-*, aria-*, etc. Internal `data-ls-*` / `data-spindle-ext` wrapper attributes are stripped. Empty object if no attributes set. |
+| `text` | `string` | Element's textContent — concatenated text from this element and all descendants. Empty string if no text content. Includes text inside hidden-via-CSS elements (matches textContent semantics, not visibility). Use `delegate(...)` events for live form-control values like input.value (which are properties, not attributes). |
+| `childCount` | `number` | Number of direct ELEMENT children (text nodes and comment nodes are NOT counted). Use the `html` option to inspect the full subtree. |
+| `html?` | `string` | Element's innerHTML. Present only when read({ html: true }) was passed. Reflects whatever the frontend currently has — including any host-side modifications (e.g. Lumiverse markdown rendering) that mutated the originally-injected HTML. |
 
 ### ConditionalPreventDefault
 
-*Predicate-based preventDefault rule for DOMDelegateOptions / DOMListenOptions (v0.27.5+). Fires event.preventDefault() only when the event matches all provided filters (AND semantics). Each filter is optional; empty {} = always match (equivalent to `preventDefault: true`). Filters are evaluated synchronously frontend-side at fire time. Common shapes: { onKeys: ['Enter'], whenModifiers: { exclude: ['shift'] } } (plain Enter, not Shift+Enter); { onKeys: ['s', 'S'], whenModifiers: { require: ['ctrl'] } } (Ctrl+S override); { onButtons: [2] } (right-click only).*
+*Predicate-based preventDefault rule for DOMDelegateOptions / DOMListenOptions. Fires event.preventDefault() only when the event matches all provided filters (AND semantics). Each filter is optional; empty {} = always match (equivalent to `preventDefault: true`). Filters are evaluated synchronously frontend-side at fire time. Common shapes: { onKeys: ['Enter'], whenModifiers: { exclude: ['shift'] } } (plain Enter, not Shift+Enter); { onKeys: ['s', 'S'], whenModifiers: { require: ['ctrl'] } } (Ctrl+S override); { onButtons: [2] } (right-click only).*
 
 | Field | Type | Description |
 | --- | --- | --- |
@@ -622,12 +774,12 @@ LumiScript **runtime directives** are special comments that change how the runti
 | Field | Type | Description |
 | --- | --- | --- |
 | `role` | `'system' | 'user' | 'assistant'` | Message sender role. |
-| `content` | `string | LlmMessagePart[]` | Plain string (simple case) OR an array of parts. Parts let scripts thread native tool_use / tool_result payloads through an agentic loop instead of text-encoding them. Available since v0.29.0. |
-| `reasoning_content?` | `string` | Thinking-mode reasoning content from the previous assistant turn, echoed back on the next request. REQUIRED by DeepSeek thinking-mode models on tool-call continuations (the API returns 400 invalid_request_error: "The 'reasoning_content' in the thinking mode must be passed back to the API." without it). Plain-text continuations and non-thinking models don't need it. Other providers routing DeepSeek (NanoGPT, OpenRouter) inherit the requirement; providers without thinking mode ignore the field. Copy from LLMRawResult.reasoning_content after each generateWithTools call. Available since v0.30.2 / lumiverse-spindle-types ≥0.4.72. |
+| `content` | `string | LlmMessagePart[]` | Plain string (simple case) OR an array of parts. Parts let scripts thread native tool_use / tool_result payloads through an agentic loop instead of text-encoding them. |
+| `reasoning_content?` | `string` | Thinking-mode reasoning content from the previous assistant turn, echoed back on the next request. REQUIRED by DeepSeek thinking-mode models on tool-call continuations (the API returns 400 invalid_request_error: "The 'reasoning_content' in the thinking mode must be passed back to the API." without it). Plain-text continuations and non-thinking models don't need it. Other providers routing DeepSeek (NanoGPT, OpenRouter) inherit the requirement; providers without thinking mode ignore the field. Copy from LLMRawResult.reasoning_content after each generateWithTools call. |
 
 ### LlmMessagePart
 
-*A single content part inside an LLMMessage. Discriminated union — switch on the `type` field. Mirrors the host's LlmMessagePartDTO; available since v0.29.0 / lumiverse-spindle-types ≥0.4.71.*
+*A single content part inside an LLMMessage. Discriminated union — switch on the `type` field. Mirrors the host's LlmMessagePartDTO.*
 
 | Field | Type | Description |
 | --- | --- | --- |
@@ -674,7 +826,7 @@ LumiScript **runtime directives** are special comments that change how the runti
 | --- | --- | --- |
 | `content` | `string` | Text generated by the LLM. Empty string when tool_calls is present. |
 | `tool_calls?` | `ToolCall[]` | Function calls requested by the LLM. When present, content is typically empty. |
-| `reasoning_content?` | `string` | Thinking-mode reasoning content from this turn. Present on tool-call iterations against DeepSeek-thinking models. Copy onto the assistant turn you append to history before the next call (set LLMMessage.reasoning_content). Other providers ignore it. Available since v0.30.2. |
+| `reasoning_content?` | `string` | Thinking-mode reasoning content from this turn. Present on tool-call iterations against DeepSeek-thinking models. Copy onto the assistant turn you append to history before the next call (set LLMMessage.reasoning_content). Other providers ignore it. |
 
 ### LLMRawResultStructured
 
@@ -684,7 +836,7 @@ LumiScript **runtime directives** are special comments that change how the runti
 | --- | --- | --- |
 | `content?` | `T` | Final step: JSON-parsed and Zod-validated result typed as T (the schema you passed as the 4th arg to generateWithTools). |
 | `tool_calls?` | `ToolCall[]` | Intermediate steps: function calls requested by the LLM. When present, content is absent. |
-| `reasoning_content?` | `string` | Thinking-mode reasoning content from this turn. Same semantics as LLMRawResult.reasoning_content — copy onto the next assistant turn for DeepSeek-thinking tool loops. Available since v0.30.2. |
+| `reasoning_content?` | `string` | Thinking-mode reasoning content from this turn. Same semantics as LLMRawResult.reasoning_content — copy onto the next assistant turn for DeepSeek-thinking tool loops. |
 
 ### ToolCall
 
@@ -774,6 +926,7 @@ LumiScript **runtime directives** are special comments that change how the runti
 | `headers?` | `Record<string, string>` | Request headers. |
 | `body?` | `string` | Request body (string). Use JSON.stringify for JSON payloads. |
 | `timeout?` | `number` | Request timeout in milliseconds. |
+| `responseType?` | `'text' | 'arraybuffer'` | Decoding hint for the response body. 'text' (default) yields a string; 'arraybuffer' yields a Uint8Array of the raw response bytes (LumiScript decodes the host's base64 transport transparently). Use 'arraybuffer' when fetching images, PDFs, or any binary payload destined for api.images.upload / api.utils.image.* / api.files.*. |
 
 ### HttpResponse
 
@@ -784,7 +937,7 @@ LumiScript **runtime directives** are special comments that change how the runti
 | `status` | `number` | HTTP status code (e.g. 200, 404). |
 | `statusText` | `string` | HTTP status text (e.g. "OK", "Not Found"). |
 | `headers` | `Record<string, string>` | Response headers. |
-| `body` | `string` | Response body as a string. Use JSON.parse for JSON responses. |
+| `body` | `string | Uint8Array` | Response body. `string` when the request's responseType was 'text' or omitted; `Uint8Array` when 'arraybuffer'. Use JSON.parse on string bodies for JSON; pipe Uint8Array bodies into api.images.upload or api.utils.image.detectMime. |
 
 ### TempWriteOptions
 
@@ -828,10 +981,13 @@ LumiScript **runtime directives** are special comments that change how the runti
 | `personality` | `string` | Personality summary. |
 | `scenario` | `string` | Scenario / setting. |
 | `firstMessage` | `string` | Opening message / greeting. |
+| `mesExample` | `string` | Example dialogue. Free-form text shown to the LLM as an example of how the character speaks. |
+| `creatorNotes` | `string` | Free-form notes from the character author (usage guidance, change history, etc.). Not shown to the LLM. |
 | `systemPrompt` | `string` | Character-level system prompt. |
 | `postHistoryInstructions` | `string` | Instructions appended after chat history. |
 | `tags` | `string[]` | Searchable tags. |
 | `alternateGreetings` | `string[]` | Additional greeting variants. |
+| `creator` | `string` | Creator name / attribution string. |
 | `imageId` | `string | null` | Avatar image ID. Null if no avatar. |
 | `worldBookIds` | `string[]` | World book IDs attached to this character. |
 | `extensions` | `Record<string, unknown>` | Free-form extension data attached to the character (per-character analog of message.extra). Namespace your keys (e.g. "my-script:state") to avoid collisions with other extensions / Lumiverse-internal fields. Reads return the full blob; writes via update() shallow-merge into existing — top-level keys overwrite, omitted keys preserved, nested objects replaced wholesale (NOT recursively merged). Keep values JSON-serializable. |
@@ -849,6 +1005,8 @@ LumiScript **runtime directives** are special comments that change how the runti
 | `personality?` | `string` | Personality summary. |
 | `scenario?` | `string` | Scenario / setting. |
 | `firstMessage?` | `string` | Opening message. |
+| `mesExample?` | `string` | Example dialogue. |
+| `creatorNotes?` | `string` | Free-form notes from the character author (not shown to the LLM). |
 | `systemPrompt?` | `string` | Character-level system prompt. |
 | `postHistoryInstructions?` | `string` | Post-history instructions. |
 | `tags?` | `string[]` | Searchable tags. |
@@ -868,6 +1026,8 @@ LumiScript **runtime directives** are special comments that change how the runti
 | `personality?` | `string` | Personality summary. |
 | `scenario?` | `string` | Scenario / setting. |
 | `firstMessage?` | `string` | Opening message. |
+| `mesExample?` | `string` | Example dialogue. |
+| `creatorNotes?` | `string` | Free-form notes from the character author (not shown to the LLM). |
 | `systemPrompt?` | `string` | Character-level system prompt. |
 | `postHistoryInstructions?` | `string` | Post-history instructions. |
 | `tags?` | `string[]` | Searchable tags. |
@@ -1262,7 +1422,7 @@ LumiScript **runtime directives** are special comments that change how the runti
 | `definition` | `string` | Lumia "definition" field — physical / identity description. |
 | `personality` | `string` | Lumia "personality" field. |
 | `behavior` | `string` | Lumia "behavior" field — behavioural patterns. |
-| `genderIdentity` | `0 | 1 | 2` | 0 = unspecified, 1 = feminine, 2 = masculine. (Note: upstream council.md docs describe a wider 4-value range; LumiScript matches the typed surface in spindle-types 0.4.40 — type-vs-doc inconsistency tracked.) |
+| `genderIdentity` | `0 | 1 | 2` | 0 = unspecified, 1 = feminine, 2 = masculine. (Note: upstream council.md docs describe a wider 4-value range; LumiScript matches the actual typed surface — type-vs-doc inconsistency tracked upstream.) |
 
 ### CouncilToolsSettings
 
@@ -1325,32 +1485,13 @@ LumiScript **runtime directives** are special comments that change how the runti
 
 ### ToolInvocationContext
 
-*Optional third parameter passed to tool handlers. Populated when invoked via Lumiverse TOOL_INVOCATION; undefined when invoked via api.tools.invoke() (script-to-script). Field-level host requirements: requestId/councilMember require Lumiverse 8d310f8+ (spindle-types 0.4.25+); contextMessages require Lumiverse 993544c8+ (spindle-types 0.4.26+). Older hosts leave the corresponding fields undefined and the helper gracefully falls back.*
+*Optional third parameter passed to tool handlers. Populated when invoked via Lumiverse TOOL_INVOCATION; undefined when invoked via api.tools.invoke() (script-to-script). The Council-path fields (requestId, councilMember, contextMessages) are populated together; the script-to-script path leaves them all undefined.*
 
 | Field | Type | Description |
 | --- | --- | --- |
 | `requestId?` | `string` | Host-side correlation id for this invocation. Useful for matching handler-side logs against Lumiverse server logs. |
 | `councilMember?` | `CouncilMemberContext` | Personality snapshot of the Council member that triggered the invocation. Populated only when the tool ran as part of a Council execution cycle; undefined for inline function-calling, api.tools.invoke(), and older hosts. |
 | `contextMessages?` | `LLMMessage[]` | Structured chat context for Council invocations — same content as args.context but with role boundaries preserved. Prefer this over args.context when available — the ls:council-prompt helper's buildCouncilMessages uses it automatically when passed via the contextMessages option. Multi-part (text+image) content is flattened to its text portion before delivery. Undefined for non-Council paths / older hosts. |
-
-### CouncilMemberContext
-
-*Re-exported from lumiverse-spindle-types. Personality snapshot of the Council member that triggered a tool invocation — identity, role, avatar, and Lumia personality fields. Delivered on ToolInvocationContext.councilMember.*
-
-| Field | Type | Description |
-| --- | --- | --- |
-| `memberId` | `string` | Unique Council member id (Council settings row id). |
-| `itemId` | `string` | Source Lumia item id this member is backed by. |
-| `packId` | `string` | Pack id the Lumia item lives in. |
-| `packName` | `string` | Pack name the Lumia item lives in. |
-| `name` | `string` | Display name of the Lumia item (also used as the member name). |
-| `role` | `string` | Freeform role description assigned by the user (e.g. "Plot Enforcer", "Comic Relief"). |
-| `chance` | `number` | Probability (0–100) that this member participates in each generation. |
-| `avatarUrl` | `string | null` | Relative URL to the member's avatar (e.g. "/api/v1/images/{id}"), or null. |
-| `definition` | `string` | Lumia "definition" field — physical/identity description. |
-| `personality` | `string` | Lumia "personality" field. |
-| `behavior` | `string` | Lumia "behavior" field — behavioural patterns. |
-| `genderIdentity` | `0 | 1 | 2` | Gender identity marker (0=unspecified, 1=feminine, 2=masculine). |
 
 ### RegisteredToolInfo
 
@@ -1633,6 +1774,202 @@ LumiScript **runtime directives** are special comments that change how the runti
 | `timeoutMs?` | `number` | Max wait in ms. Default 60_000 (60s). Throws on timeout. |
 | `pollIntervalMs?` | `number` | Poll interval in ms. Default 500. |
 
+### ImageInfo
+
+*Returned by api.images.upload / uploadFromDataUrl / get. Camel-case mirror of ImageDTO from Spindle.*
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `id` | `string` | Canonical image id — the handle accepted by api.images.get / api.theme.extractColors / api.imageGen img2img / spindle.characters.setAvatar. |
+| `originalFilename` | `string` | Original filename preserved at upload time. |
+| `mimeType` | `string` | Image MIME type (image/png, image/jpeg, image/webp, image/gif, image/bmp). |
+| `width` | `number | null` | Pixel width if the host could derive it from the upload. |
+| `height` | `number | null` | Pixel height if the host could derive it from the upload. |
+| `hasThumbnail` | `boolean` | Whether the host has generated a thumbnail variant for this image. |
+| `url` | `string` | Relative authenticated URL for this image, already sized to specificity. |
+| `specificity` | `string` | Image specificity flag — 'full' / 'sm' / 'lg'. |
+| `ownerExtensionIdentifier` | `string | null` | Which extension uploaded the image — null for user-uploaded. |
+| `ownerCharacterId` | `string | null` | Character ownership tag if set at upload time. |
+| `ownerChatId` | `string | null` | Chat ownership tag if set at upload time. |
+| `createdAt` | `number` | Creation timestamp (Unix ms). |
+
+### ImageUploadInput
+
+*Passed to api.images.upload(input).*
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `data` | `Uint8Array` | Raw image bytes. Source via api.utils.http.* with responseType:'arraybuffer', api.utils.image.dataUrlToBytes, api.files.*, etc. |
+| `filename?` | `string` | Optional filename to preserve when storing. |
+| `mimeType?` | `string` | Optional content type override. Defaults to image/png when not inferable host-side. |
+| `ownerCharacterId?` | `string` | Optional character ownership tag for the persisted image. |
+| `ownerChatId?` | `string` | Optional chat ownership tag for the persisted image. |
+
+### ImageUploadFromDataUrlOptions
+
+*Passed to api.images.uploadFromDataUrl(dataUrl, options?). The data URL itself carries the bytes + MIME; these options only set ownership / display metadata.*
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `originalFilename?` | `string` | Original filename to preserve on the persisted image. |
+| `ownerCharacterId?` | `string` | Optional character ownership tag. |
+| `ownerChatId?` | `string` | Optional chat ownership tag. |
+
+### ImageGenInput
+
+*Passed to api.imageGen.generate(input). Mirrors ImageGenRequestDTO with camel-case field names on the LumiScript surface.*
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `prompt` | `string` | Text prompt for image generation. Required. |
+| `connectionId?` | `string` | Connection profile to use. When omitted, uses the user's default image-gen connection (set via the Lumiverse UI). Look up via api.imageGen.listConnections(). |
+| `negativePrompt?` | `string` | Negative prompt — provider-dependent support. |
+| `model?` | `string` | Override the connection profile's model. Look up via api.imageGen.getModels(connectionId). |
+| `parameters?` | `Record<string, unknown>` | Provider-specific parameters (width, height, steps, cfg_scale, etc.). Validate against the provider's `parameters` schema from getProviders() if your script accepts user input. For img2img / inpainting providers, pass arrays of imageId strings under the image_array-typed parameter (e.g. `{ input_images: [imageId, ...] }`). Merged with the connection's defaultParameters host-side. |
+| `ownerCharacterId?` | `string` | Tag the persisted result with a character ownership marker. |
+| `ownerChatId?` | `string` | Tag the persisted result with a chat ownership marker. |
+
+### ImageGenResult
+
+*Returned by api.imageGen.generate(input). The `imageId` is the integration seam — pass to api.images.get / api.theme.extractColors / spindle.characters.setAvatar. Use `imageDataUrl` for inline rendering (no auth needed) or `imageUrl` for push-notification image fields.*
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `imageDataUrl` | `string` | Generated image as a base64 data URL — directly assignable to &lt;img src&gt;. Available immediately regardless of host-side persistence success. |
+| `model` | `string` | Model that was actually used (may differ from input if `model` was omitted and the connection's default applied). |
+| `provider` | `string` | Provider id that handled the generation. |
+| `imageId?` | `string` | Canonical image id in Lumiverse's image table. Pass to api.images.get, api.theme.extractColors, spindle.characters.setAvatar, etc. Present when host-side persistence succeeded (the typical case). When absent, use imageDataUrl for inline rendering. |
+| `imageUrl?` | `string` | Public unauthenticated URL for the persisted image. Auth-free so push-notification clients can render it without an auth header: api.ui.pushNotification(title, body, { image: result.imageUrl }) — pushNotification is positional (title, body, options?), NOT object-form. |
+
+### ImageGenProviderInfo
+
+*Returned by api.imageGen.getProviders(). Each provider declares its capability schema; drive dynamic parameter UIs from `capabilities.parameters`.*
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `id` | `string` | Provider id (e.g. "nanogpt", "openai", "stability"). |
+| `name` | `string` | Human-readable provider name. |
+| `capabilities.parameters` | `Record<string, ImageGenParameterSchema>` | Per-parameter contract — validate args before generate() to surface errors fast. |
+| `capabilities.apiKeyRequired` | `boolean` | Whether the provider requires an API key on the connection profile. |
+| `capabilities.modelListStyle` | `'static' | 'dynamic' | 'google'` | How models are listed. Static providers expose them under capabilities.staticModels; dynamic providers fetch from upstream via api.imageGen.getModels(connectionId). |
+| `capabilities.staticModels?` | `Array<{ id: string; label: string }>` | Populated when modelListStyle === 'static'. |
+| `capabilities.defaultUrl` | `string` | Provider's default API URL — used as a placeholder when creating new connection profiles. |
+
+### ImageGenConnectionInfo
+
+*Returned by api.imageGen.listConnections() / getConnection(). API keys are NEVER exposed — only `hasApiKey: boolean` indicates presence.*
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `id` | `string` | Connection profile id. |
+| `name` | `string` | User-assigned connection name. |
+| `provider` | `string` | Provider id this connection talks to. |
+| `apiUrl` | `string` | API URL configured on the connection. |
+| `model` | `string` | Default model on the connection. |
+| `isDefault` | `boolean` | Whether this is the user's default image-gen connection — used by generate() when connectionId is omitted. |
+| `hasApiKey` | `boolean` | Whether the user has supplied an API key for this connection. The key itself is never exposed. |
+| `defaultParameters` | `Record<string, unknown>` | Per-connection default parameter values — merged with the request's `parameters` at generate() time. |
+| `metadata` | `Record<string, unknown>` | Arbitrary metadata attached to the connection. |
+| `createdAt` | `number` | Creation timestamp (Unix ms). |
+| `updatedAt` | `number` | Last update timestamp (Unix ms). |
+
+### ImageGenParameterSchema
+
+*One parameter's contract within an ImageGenProviderInfo.capabilities.parameters record. Use to drive dynamic parameter UIs or validate user-supplied args before calling generate().*
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `type` | `'number' | 'integer' | 'boolean' | 'string' | 'select' | 'image_array'` | Parameter primitive. `select` has a fixed enum (see options); `image_array` takes arrays of imageId strings (img2img / inpainting providers). |
+| `default?` | `unknown` | Default value when the user omits the parameter. |
+| `min?` | `number` | Minimum value for numeric parameters. |
+| `max?` | `number` | Maximum value for numeric parameters. |
+| `step?` | `number` | Step granularity for numeric parameters — useful for slider UIs. |
+| `description` | `string` | Human-readable description — surface to users in your parameter UI. |
+| `required?` | `boolean` | Whether the parameter must be supplied (no default applies). |
+| `options?` | `Array<{ id: string; label: string }>` | Enum entries for select-typed parameters. |
+| `group?` | `string` | Optional grouping label — UI may render parameters with the same group together. |
+
+### ColorRGB
+
+*RGB color value, 0–255 per channel. Used in ColorExtractionInfo.dominant / regions.* / average.*
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `r` | `number` | Red channel, 0–255. |
+| `g` | `number` | Green channel, 0–255. |
+| `b` | `number` | Blue channel, 0–255. |
+
+### ColorHSL
+
+*HSL color value. Used in ColorExtractionInfo.dominantHsl + ThemePaletteConfig.accent + ThemeInfo.accent. Drop-in compatible across all three — the typical pipeline is `extractColors(imageId).then(p => applyPalette({accent: p.dominantHsl}))`.*
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `h` | `number` | Hue, 0–360 degrees. |
+| `s` | `number` | Saturation, 0–100 percent. |
+| `l` | `number` | Lightness, 0–100 percent. |
+
+### ColorExtractionInfo
+
+*Returned by api.theme.extractColors(imageId). `dominantHsl` is the ready-to-pass accent for api.theme.applyPalette({accent: ...}).*
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `dominant` | `ColorRGB` | Dominant color of the full image, in RGB. |
+| `regions` | `{ top: ColorRGB; center: ColorRGB; bottom: ColorRGB; left: ColorRGB; right: ColorRGB }` | Per-region dominant colors. Useful for asymmetric layouts (e.g. character portrait centered with background dominant on edges). |
+| `flatness` | `{ top: number; center: number; bottom: number; left: number; right: number; full: number }` | Per-region + full-image flatness score (0 = highly variegated, 1 = uniform). Use to detect "all one color" cases. |
+| `average` | `ColorRGB` | Arithmetic mean RGB across the full image. |
+| `isLight` | `boolean` | Whether the dominant color is perceived as light (luminance &gt; 152). Useful for picking complementary foreground colors. |
+| `dominantHsl` | `ColorHSL` | HSL representation of dominant — drop-in for api.theme.applyPalette({accent: ...}). |
+
+### ThemeOverride
+
+*Passed to api.theme.apply(overrides). Two-axis: `variables` applies regardless of mode, `variablesByMode` applies per dark/light at apply time. LumiScript maintains per-script attribution — multiple scripts' apply() calls merge with per-key last-applied-wins semantics.*
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `variables?` | `Record<string, string>` | Flat CSS variable map applied regardless of the current mode. Keys are `--lumiverse-*` variable names (or any custom prefix). |
+| `variablesByMode?` | `{ dark?: Record<string, string>; light?: Record<string, string> }` | Mode-keyed overrides. The host picks `dark` or `light` at apply time based on the user's current mode. Mode-specific values take precedence over flat `variables` for the same key. |
+
+### ThemePaletteConfig
+
+*Passed to api.theme.applyPalette(palette | null). Lumiverse generates the full coherent variable set from the accent — preserves the user's glass / radius / font / UI-scale settings. Across LumiScript scripts: most-recent-script-wins. Pass `null` to drop this script's palette contribution.*
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `accent` | `ColorHSL` | Primary accent color in HSL. Drop-in compatible with the dominantHsl returned by api.theme.extractColors. |
+
+### ThemeInfo
+
+*Returned by api.theme.getCurrent(). Read-only snapshot of the user's current theme configuration (NOT including any extension overrides).*
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `id` | `string` | Theme id (e.g. "lumiverse-purple"). |
+| `name` | `string` | Theme display name. |
+| `mode` | `'light' | 'dark'` | Resolved color mode. |
+| `accent` | `ColorHSL` | Primary accent. |
+| `enableGlass` | `boolean` | Whether glassmorphic backdrop-filter tokens are enabled. |
+| `radiusScale` | `number` | Border radius multiplier. |
+| `fontScale` | `number` | Font-size multiplier. |
+| `uiScale` | `number` | Overall UI scale multiplier. |
+| `characterAware` | `boolean` | Whether the theme adapts to the active character's avatar palette automatically (host-side feature, independent of api.theme.extractColors). |
+
+### ThemeVariablesConfig
+
+*Passed to api.theme.generateVariables(config). Mirrors the inputs that Lumiverse's theme engine uses to produce the full set of ~80+ CSS variables. The result can be passed to apply({variables}) for a complete coherent override, or tweaked individually before applying.*
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `accent` | `ColorHSL` | Primary accent color in HSL. |
+| `mode` | `'dark' | 'light'` | Resolved color mode. |
+| `enableGlass?` | `boolean` | Enable glassmorphic backdrop-filter tokens. Default: true. |
+| `radiusScale?` | `number` | Border radius multiplier. Default: 1. |
+| `fontScale?` | `number` | Font-size multiplier. Default: 1. |
+| `uiScale?` | `number` | Overall UI scale multiplier. Default: 1. |
+| `baseColors?` | `Record<string, string>` | Optional base colors override (advanced — typically not needed; the accent + mode produce a coherent set on their own). |
+| `statusColors?` | `Record<string, string>` | Optional status colors override (success / warning / error / info — advanced). |
+
 ---
 
 ## API Functions
@@ -1641,19 +1978,19 @@ LumiScript **runtime directives** are special comments that change how the runti
 
 | Method | Arguments | Description |
 | --- | --- | --- |
-| `getMessages` | options? | Get messages in the current chat. Pass { last: N } for the N most recent. |
-| `sendMessage` | content, options? | Append a new message. Options: role, metadata. |
+| `getMessages` | options? | Get messages in the current chat. Pass `{ last: N }` for the N most recent or `{ first: N }` for the N oldest (omit for the full message list). Requires chat_mutation permission. |
+| `sendMessage` | content, options? | Append a new message. Options: role, metadata, triggerGeneration (when true, fires the host's full chat-orchestration pipeline after the append — same effect as the user pressing Enter on an empty input bar), generation (per-call ChatGenerationOptions overrides — connectionId / personaId / presetId / parameters / etc., consulted only when triggerGeneration is true). Requires chat_mutation permission. |
 | `editMessage` | id, contentOrPatch | Edit a message by ID. Pass a string to replace the active swipe's content, or a MessagePatch to update swipes / swipeId / swipeDates / reasoning / metadata. Patches touching swipe-shaped fields fire SWIPE_EDITED alongside MESSAGE_EDITED. |
 | `deleteMessage` | id | Delete a message by ID. |
 | `getChatId` | — | Return the active chat ID, or null. |
-| `getMetadata` | key | Get a metadata value from the current chat. |
-| `setMetadata` | key, value | Set a metadata key (read-modify-write). |
+| `getMetadata` | key | Get a metadata value from the current chat. Requires chats permission (note: distinct from chat_mutation — chats gates session-level fields, chat_mutation gates message content). |
+| `setMetadata` | key, value | Set a metadata key (read-modify-write). Requires chats permission. |
 | `inject` | id, content, options? | Register a prompt injection. Options: mode, role, depth, ephemeral. |
 | `removeInjection` | id | Remove one injection by ID. |
 | `getInjections` | — | List all active injections across all scripts. |
-| `clearInjections` | — | Remove all injections from this script. |
-| `clearAllInjections` | — | Remove ALL injections across all scripts. |
-| `registerContentProcessor` | handler, options? | Register a handler that fires before a user-initiated message write hits SQLite. Returns a patch { content?, extra? } to transform what gets stored. Options: id, priority (default 100), origin filter, timeoutMs (default 2000). NOT invoked for api.chat.* mutations (loop safety). Returns handle { id, remove }. Requires chat_mutation. |
+| `clearInjections` | — | Remove all injections from this script. Requires interceptor permission. |
+| `clearAllInjections` | — | Remove ALL injections across all scripts (cross-script wipe — use sparingly). Requires interceptor permission + allowDangerous. |
+| `registerContentProcessor` | handler, options? | Register a handler that fires on chat message origin events — `create` (user/assistant message write), `update`, `swipe_add`, `swipe_update`, auto-inserted greetings on the write side, AND on per-message display rendering (`render`). Return a patch { content?, extra? } to transform what gets stored or shown. Options: id, priority (default 100), origin filter, timeoutMs (default 2000). NOT invoked for api.chat.* mutations (loop safety). `extra` is IGNORED on swipe origins (swipes share the parent message's extra) and on `render` (no row to mutate). Returns handle { id, remove }. Requires chat_mutation permission. |
 | `listContentProcessors` | — | List all currently registered message content processors across all scripts. |
 | `setMessageHidden` | id, hidden | Mark a single message as hidden or visible. Hidden messages are excluded from vector retrieval but still included in prompt assembly. Toggle pattern: pass `true` to hide, `false` to unhide. Persists on the message — survives reloads. Requires chat_mutation permission. |
 | `setMessagesHidden` | ids, hidden | Bulk variant of `setMessageHidden`. Max 500 IDs per call. Same hidden-flag semantics (excluded from vector retrieval, still included in prompt assembly). Requires chat_mutation permission. |
@@ -1699,15 +2036,15 @@ LumiScript **runtime directives** are special comments that change how the runti
 
 | Method | Arguments | Description |
 | --- | --- | --- |
-| `uuid` | — | Generate a UUID v4 string. |
-| `shortId` | — | Generate a short random ID (8 chars, URL-safe). |
+| `uuid` | — | Generate a UUID v4 string. Cryptographically random (uses crypto.randomUUID). |
+| `shortId` | — | Generate a short random ID (8 chars, URL-safe). Cryptographically random (derived from crypto.randomUUID). |
 | `wait` | ms | Pause execution for ms milliseconds. |
-| `random.int` | min, max | Random integer in [min, max] inclusive. |
-| `random.float` | min, max | Random float in [min, max). |
-| `random.pick` | array | Pick a random element from an array. |
-| `random.bool` | — | Random true/false. |
-| `random.chance` | probability | Returns true with probability p (0–1). |
-| `random.shuffle` | array | Return a shuffled copy of the array. |
+| `random.int` | min, max | Random integer in [min, max] inclusive. **NOT cryptographically secure** — uses Math.random for gameplay/UI use cases. For tokens or security-sensitive identifiers use api.utils.uuid / shortId or globalThis.crypto.getRandomValues. |
+| `random.float` | min, max | Random float in [min, max). **NOT cryptographically secure** (Math.random — see random.int). |
+| `random.pick` | array | Pick a random element from an array. **NOT cryptographically secure** (Math.random — see random.int). |
+| `random.bool` | — | Random true/false. **NOT cryptographically secure** (Math.random — see random.int). |
+| `random.chance` | probability | Returns true with probability p (0–1). **NOT cryptographically secure** (Math.random — see random.int). |
+| `random.shuffle` | array | Return a shuffled copy of the array. **NOT cryptographically secure** (Math.random — see random.int). |
 | `http.get` | url, options? | GET request via cors_proxy. Requires allowDangerous. |
 | `http.post` | url, body, options? | POST request via cors_proxy. Requires allowDangerous. |
 | `http.put` | url, body, options? | PUT request via cors_proxy. Requires allowDangerous. |
@@ -1742,11 +2079,11 @@ LumiScript **runtime directives** are special comments that change how the runti
 
 | Method | Arguments | Description |
 | --- | --- | --- |
-| `inject` | target, html, options? | Inject sanitized HTML at a CSS selector. Returns DOMHandle { id, update, remove, on }. Options: position (default "beforeend"), id (stable ID for idempotent injection). Requires app_manipulation. |
+| `inject` | target, html, options? | Inject sanitized HTML at a CSS selector. Returns DOMHandle { id, update, remove, on }. Options object (single arg — NOT `inject(target, html, position, options)`): `position` (default "beforeend"), `id` (stable ID for idempotent injection — re-firing with the same id triggers in-place innerHTML update via dom_update IPC instead of a fresh insert). **Note**: when the injected HTML contains an inline `<style>` block (the host-CSS-targeting pattern — see api.ui.dom NAMESPACE_CONCEPTS), do NOT use `id`-dedup. The dom_update path replaces wrapper innerHTML, and browsers don't reliably reactivate `<style>` blocks added that way — second fire silently loses every CSS rule. Pattern for inline-style scripts that re-fire: drop `id`, call `api.ui.dom.cleanup()` at body start instead. Requires app_manipulation. |
 | `injectAtMessage` | messageId, html, options? | Inject sanitized HTML into a message bubble. Waits up to 5 s for the element if not yet rendered. Options: position ("footer" default / "header"), id (stable ID). Returns DOMHandle. Requires app_manipulation. |
-| `addStyle` | css | Add a &lt;style&gt; element scoped to this script via @scope. Returns { remove() }. Use --lumiverse-* CSS variables for theming. Requires app_manipulation. |
-| `delegate` | selector, event, handler, options? | Attach an event-delegated listener at a known root, matching descendants by CSS selector. Lets scripts react to clicks/changes on DOM the script didn't inject — e.g. interactive elements emitted by the LLM in chat-message content. Single host-side capture listener per (root, event) tuple regardless of how many scripts subscribe; selector matching happens frontend-side via event.target.closest(). Default scope (options.root: "chat") restricts matching to chat content; "document" matches anywhere on the page. Returns an unsubscribe function. v0.27.1+. Requires app_manipulation. |
-| `cleanup` | — | Remove all DOM injections, styles, and delegations created by this script. Requires app_manipulation. |
+| `addStyle` | css, opts? | Add a `<style>` element scoped to this script via `@scope ([data-ls-script="<id>"])`. Returns `{ remove() }`. Use `--lumiverse-*` CSS variables for theming. Pass `{ id: 'foo' }` for idempotent re-injection — calling `addStyle` again with the same id removes the prior stylesheet first (useful for dev-iteration where the CSS source changes between fires). Without an id, every call adds a fresh stylesheet. **Scope limitation**: rules ONLY match descendants of script-injected DOM. Cannot reach host elements (chat input bar, message bubbles, toolbar buttons, the body, etc.) because `@scope` excludes everything outside the script's wrappers. To style host UI, include an inline `<style>` block inside an `inject()` HTML payload instead — CSS rules in a `<style>` element are document-global regardless of where the tag sits. See api.ui.dom NAMESPACE_CONCEPTS for the full pattern. Requires app_manipulation permission. |
+| `delegate` | selector, event, handler, options? | Attach an event-delegated listener at a known root, matching descendants by CSS selector. Lets scripts react to clicks/changes on DOM the script didn't inject — e.g. interactive elements emitted by the LLM in chat-message content. Single host-side capture listener per (root, event) tuple regardless of how many scripts subscribe; selector matching happens frontend-side via event.target.closest(). Default scope (options.root: "chat") restricts matching to chat content; "document" matches anywhere on the page. Returns an unsubscribe function. Requires app_manipulation. |
+| `cleanup` | — | Remove all DOM injections, styles, and delegations created by THIS script (other scripts' DOM is untouched). Auto-fired on script disable / delete — manual call is for re-fire scenarios where you want to wipe and rebuild from scratch. **Canonical use**: at the top of a script body that combines re-firing triggers (`ls:startup` + `CHAT_SWITCHED` + manual Run) with inline `<style>` blocks in injected HTML. Calling `cleanup()` then `inject(...)` guarantees a fresh-inject path on every fire — which parses `<style>` correctly — instead of dom_update-via-id-dedup which doesn't reactivate inline styles. Requires app_manipulation. |
 
 ### api.files — user* (per-user persistent)
 
@@ -1822,8 +2159,8 @@ LumiScript **runtime directives** are special comments that change how the runti
 | `entries.delete` | entryId | Delete an entry by ID. |
 | `entries.listByAutomationIdPrefix` | prefix | Find all entries across all world books whose automationId starts with the given prefix. Useful for enumerating / cleaning up entries a script owns (e.g. "lumiscript:&lt;scriptId&gt;:" convention). Returns WorldInfoEntry[]; O(books × entries-per-book). |
 | `getCapturedActive` | chatId? | Get all entries that would activate for the current chat (full pipeline). |
-| `registerInterceptor` | handler, options? | Register a handler that runs BEFORE world info activation. Returns disable / enable / force / mutate decisions for the candidate entries. Returns handle { id, remove }. Multiple handlers compose by priority; vote-off precedence on disabled. 2s soft timeout (configurable). Requires generation. v0.27.0+. |
-| `listInterceptors` | — | Sync read of all currently-registered world-info interceptors. Diagnostic surface. Returns RegisteredWorldInfoInterceptorInfo[]. v0.27.0+. |
+| `registerInterceptor` | handler, options? | Register a handler that runs BEFORE world info activation. Returns disable / enable / force / mutate decisions for the candidate entries. Returns handle { id, remove }. Multiple handlers compose by priority; vote-off precedence on disabled. 2s soft timeout (configurable). Requires generation. |
+| `listInterceptors` | — | Sync read of all currently-registered world-info interceptors. Diagnostic surface. Returns RegisteredWorldInfoInterceptorInfo[]. |
 
 ### api.databanks
 
@@ -1841,7 +2178,7 @@ LumiScript **runtime directives** are special comments that change how the runti
 | `documents.create` | databankId, input | Upload a document. **Required input fields**: `data` (`string | Uint8Array` — NOT `content`) and `filename` (string with extension, e.g. `'notes.md'`). **Optional**: `mimeType`, `name` (display override). Returns immediately with `status: 'pending'` — ingestion (chunking + vectorisation) runs async. Use `waitUntilReady()` or poll `get()` to await completion. Max size 10 MB; supported extensions in DatabankDocumentCreateInput. Requires databanks permission. |
 | `documents.update` | documentId, input | Update document display name (URL slug regenerates). Requires databanks permission. |
 | `documents.delete` | documentId | Delete a document. Returns true if deleted. Requires databanks permission. |
-| `documents.getContent` | documentId | Read the document's ingested text content. Returns null if the document does not exist OR has not finished processing — check `status === 'ready'` via `get()` first, or call `waitUntilReady()` to block. Requires databanks permission. |
+| `documents.getContent` | documentId | Read the document's ingested text content. Returns `{ content: string }` on success, or `null` if the document does not exist OR has not finished processing — check `status === 'ready'` via `get()` first, or call `waitUntilReady()` to block. Requires databanks permission. |
 | `documents.reprocess` | documentId | Reset a document to `status: 'pending'`, drop its vectors, and re-queue for full reingestion. Useful after upstream content changes or when ingestion errored. Requires databanks permission. |
 | `documents.waitUntilReady` | documentId, options? | Poll until the document reaches `status: 'ready'`. Throws on error/timeout/deletion. Default 60s timeout, 500ms poll interval — override via DatabankWaitUntilReadyOptions. Use after `create()` or `reprocess()` to await ingestion. Requires databanks permission. |
 
@@ -1886,6 +2223,44 @@ LumiScript **runtime directives** are special comments that change how the runti
 | `create` | input | Create a new regex script. name and findRegex are required; everything else gets host-side defaults (placement: ['ai_output'], scope: 'global', target: 'response', flags: 'gi', etc.). |
 | `update` | scriptId, input | Update a regex script. All fields optional; only provided fields are touched. Throws if the script is not found. |
 | `delete` | scriptId | Delete a regex script. Returns true if the row was deleted. |
+
+### api.images
+
+| Method | Arguments | Description |
+| --- | --- | --- |
+| `upload` | input | Upload raw image bytes to Lumiverse's image store. `input.data` is a Uint8Array (source via api.utils.http.* with responseType:'arraybuffer', api.utils.image.dataUrlToBytes, api.files.*, etc.). Optional: filename, mimeType, ownerCharacterId, ownerChatId. Returns the ImageInfo whose `id` can be passed to api.theme.extractColors or stored on a character avatar. Requires images permission. |
+| `uploadFromDataUrl` | dataUrl, options? | Convenience: upload from a `data:image/...;base64,...` data URL. Optional options: originalFilename, ownerCharacterId, ownerChatId. Returns ImageInfo. Requires images permission. |
+| `get` | imageId | Look up an image by id. Returns ImageInfo or null. Requires images permission. |
+| `delete` | imageId | Delete an image by id. Returns `true` if a row was removed. Requires images permission. |
+
+### api.imageGen
+
+| Method | Arguments | Description |
+| --- | --- | --- |
+| `generate` | input | Generate an image. `input.prompt` required; optional: connectionId (default: user's default connection), negativePrompt, model, parameters (provider-specific — validate against the provider's `parameters` schema from getProviders() if your script accepts user input), ownerCharacterId, ownerChatId. Returns ImageGenResult { imageDataUrl, model, provider, imageId?, imageUrl? } — `imageId` is the canonical handle accepted by api.images.get / api.theme.extractColors / characters.setAvatar; `imageUrl` is an auth-free public URL suitable for api.ui.pushNotification(title, body, { image: result.imageUrl }) — pushNotification is positional, NOT object-form. For img2img / inpainting, pass `parameters: { input_images: [imageId, ...] }`. Requires image_gen permission. |
+| `getProviders` | — | List all image-generation providers available on this Lumiverse install along with their capability schemas. Each provider's `capabilities.parameters` describes the supported `parameters` for generate() calls against that provider's connections — use to drive dynamic parameter UIs. Requires image_gen permission. |
+| `listConnections` | — | List the user's image-gen connection profiles. API keys are never exposed — only `hasApiKey: boolean`. Use to populate a connection picker UI. Requires image_gen permission. |
+| `getConnection` | connectionId | Get a single image-gen connection profile by id. Returns ImageGenConnectionInfo or null. Requires image_gen permission. |
+| `getModels` | connectionId | List the models available on a connection profile. For dynamic-list providers, this fetches live from the upstream API (network round-trip). Static-list providers return their capabilities.staticModels directly. Returns Array&lt;{id, label}&gt;. Requires image_gen permission. |
+
+### api.oauth
+
+| Method | Arguments | Description |
+| --- | --- | --- |
+| `onCallback` | handler | Register a callback handler for this extension's OAuth redirect URL. Handler receives the URL query params as Record&lt;string, string&gt;; optional return { html } becomes the response body shown in the user's browser tab. **Single handler per extension** (host stores in a module-scope ref; last-wins). LumiScript emits a `spindle.log.warn` on cross-script or same-script-re-register collisions — non-terminating; the host's last-wins behavior is preserved. Returns a sync unsubscribe fn. Requires oauth permission. |
+| `getCallbackUrl` | — | Get the host-relative callback URL path (e.g. `/api/spindle-oauth/lumiscript/callback`). Stable per-extension; use as the `redirect_uri` in your authorize URL construction. Async on the LumiScript side due to IPC boundary even though the host method is sync. Requires oauth permission. |
+| `createState` | — | Mint a CSRF state nonce. Pass to your authorize URL as `state=...`; the host verifies the returned state at callback time and rejects mismatches before invoking your handler. Requires oauth permission. |
+
+### api.theme
+
+| Method | Arguments | Description |
+| --- | --- | --- |
+| `apply` | overrides | Apply CSS variable overrides on top of the user's current theme. `overrides.variables` is a flat map applied regardless of mode; `overrides.variablesByMode.{dark,light}` is mode-selected at apply time by the host. LumiScript maintains per-script attribution — multiple scripts' apply calls merge with per-key last-applied-wins semantics. Requires app_manipulation permission. |
+| `applyPalette` | palette \| null | Apply a palette-driven theme. `palette.accent` is `{h, s, l}` and Lumiverse generates the full variable set coherently, preserving the user's glass/radius/font/UI-scale. Pass `null` to drop this script's palette contribution. Across LumiScript scripts: most-recent-script-wins. Requires app_manipulation permission. |
+| `clear` | — | Drop this script's contributions from the per-script override registry, re-merge, push the post-clear result to spindle.theme.{apply,applyPalette}. Auto-called on script disable / delete. Requires app_manipulation permission. |
+| `getCurrent` | — | Get a read-only snapshot of the user's current theme configuration (NOT including any extension overrides). Returns ThemeInfo with id, name, mode ('light' \| 'dark'), accent (HSL), enableGlass, radiusScale, fontScale, uiScale, characterAware. Requires app_manipulation permission. |
+| `extractColors` | imageId | Extract a color palette from an image stored in Lumiverse's image system. `imageId` is a host-side UUID (sources: `character.imageId`, `api.images.upload(...).id`). Returns ColorExtractionInfo with dominant + per-region RGB + flatness scores + isLight + dominantHsl (ready to pass to applyPalette). Throws if the id is unknown. Requires app_manipulation permission. |
+| `generateVariables` | config | Generate the full set of Lumiverse CSS variables from a theme config without applying them. Pass the result to apply({variables}) for a complete coherent override (or tweak individual keys before applying). config.accent + config.mode required; glass/radius/font/UI-scale/baseColors/statusColors optional. Requires app_manipulation permission. |
 
 ### api.council
 
@@ -1984,6 +2359,17 @@ LumiScript **runtime directives** are special comments that change how the runti
 | `collection.clear` | — | Remove all records, leaving an empty collection file. |
 | `collection.query` | jsonQuery | Run a jsonquery string against the full collection. Escape hatch for aggregations / sorts / complex projections. Example: 'filter(.margin &gt; 0) \| size()'. Throws SyntaxError on malformed queries. |
 
+### api.scriptStorage
+
+| Method | Arguments | Description |
+| --- | --- | --- |
+| `get` | key, defaultValue? | Read a value. Returns `defaultValue` (or `undefined` if not provided) when the key is missing. Generic type hint via `get<T>(...)` for IDE completion — the runtime doesn't enforce T. |
+| `set` | key, value | Write a value. Overwrites any prior value at the key. Fires `ls:scriptStorage:set` with `{ scriptId, key, value }`. Throws "capacity exceeded" if the JSON-serialised total would cross the 1 MB per-script cap (use `api.variables.*` or `api.db.*` for storage at this scale). Value must be JSON-serialisable. |
+| `delete` | key | Remove a key. Returns `true` if it existed (and fires `ls:scriptStorage:delete` with `{ scriptId, key }`), `false` if it didn't (no broadcast). |
+| `has` | key | Check whether a key exists. Returns true for keys with any value including 0 / false / null / "". |
+| `clear` | — | Remove every entry for this script. Fires `ls:scriptStorage:clear` with `{ scriptId }` if at least one entry existed; no broadcast for an already-empty storage. |
+| `keys` | — | List the current keys. Order is insertion-order (Map semantics). |
+
 ### script
 
 | Method | Arguments | Description |
@@ -2006,7 +2392,7 @@ Built-in libraries are loaded via `script.require('ls:<name>')`. Two are current
 | `messageFooter` | messageId, html, options? | Attach a styled footer below a message bubble. Returns DOMHandle, or CollapsibleDOMHandle when options.collapsible is true. Options: { id?, className?, collapsible?, title?, defaultCollapsed? }. |
 | `messageHeader` | messageId, html, options? | Attach a styled header above message content. Returns DOMHandle, or CollapsibleDOMHandle when options.collapsible is true. Options: { id?, className?, collapsible?, title?, defaultCollapsed? }. |
 | `progressBar` | target, options? | Inject a progress bar with live setValue(). Returns ProgressBarHandle. Options: { value?, label?, color?, showPercent?, height?, id?, className? }. |
-| `floatingButton` | label, options? | Fixed-position action button. Returns DOMHandle. Options: { position?, icon?, variant?, size?, id?, className? }. |
+| `floatingButton` | label, options? | Fixed-position action button. Returns DOMHandle. Options: { position?, icon?, variant?, size?, draggable?, id?, className? }. Pass `draggable: true` to make the button user-repositionable; the new position persists per-script via api.scriptStorage. |
 | `badgeHtml` | text, options? | Returns badge/pill HTML string for composing inside other injections. |
 | `statBarHtml` | label, value, options? | Returns labeled stat bar HTML string. Options: { max?, color?, showValue?, height?, className? }. |
 | `keyValueHtml` | label, value, options? | Returns label-value pair HTML string. Options: { muted?, className? }. |
