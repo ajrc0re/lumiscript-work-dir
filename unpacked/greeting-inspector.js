@@ -14,6 +14,7 @@ const LAST_ADVANCED_SIGNATURE_VAR = "GreetingInspectorLastAdvancedSignature";
 const ACTIVE_STATUS_VAR = "GreetingInspectorActive";
 const CONTENT_VAR = "GreetingInspectorContent";
 const AUTO_INJECT_VAR = "GreetingInspectorAutoInject";
+const ENABLED_VAR = "GreetingInspectorEnabled";
 const DEBUG_VAR = "GreetingInspectorDebug";
 
 const OLD_ACTIVE_INDEX_VAR = "greetingInspector.activeIndex";
@@ -637,6 +638,25 @@ async function writeAutoInject(enabled) {
   return normalizedValue;
 }
 
+async function readInspectorEnabled(persist = true) {
+  const hasStoredValue = await hasVariable(api.variables.character, ENABLED_VAR);
+  const stored = await getVariable(api.variables.character, ENABLED_VAR, true);
+  const enabled = hasStoredValue ? asBoolean(stored) : true;
+
+  if (persist && (!hasStoredValue || stored !== enabled)) {
+    await setVariable(api.variables.character, ENABLED_VAR, enabled);
+  }
+
+  logDebug("inspector enabled read", { enabled });
+  return enabled;
+}
+
+async function writeInspectorEnabled(enabled) {
+  const normalizedValue = Boolean(enabled);
+  await setVariable(api.variables.character, ENABLED_VAR, normalizedValue);
+  return normalizedValue;
+}
+
 async function writeInspectorActive(active) {
   await setVariable(api.variables.character, ACTIVE_STATUS_VAR, Boolean(active));
 }
@@ -663,12 +683,14 @@ function buildCharacterGreetings(character) {
   ];
 }
 
-function inactiveState(reason, detail = "") {
+function inactiveState(reason, detail = "", extraState = {}) {
   return {
     ready: false,
     reason,
     detail,
     busyAction: getBusyAction(),
+    inspectorEnabled: true,
+    ...extraState,
   };
 }
 
@@ -715,6 +737,24 @@ async function loadState(options = {}) {
 
   await runMaintenance();
 
+  const inspectorEnabled = await readInspectorEnabled();
+  if (!inspectorEnabled) {
+    logDebug("state unavailable", {
+      reason: "inspector disabled",
+      characterId: character.id,
+      character: character.name || "",
+    });
+    return inactiveState(
+      "Greeting Inspector is off for this character.",
+      character.name || "",
+      {
+        chat: activeChat,
+        character,
+        inspectorEnabled,
+      },
+    );
+  }
+
   const greetings = buildCharacterGreetings(character);
 
   if (greetings.length < 2) {
@@ -726,6 +766,11 @@ async function loadState(options = {}) {
     return inactiveState(
       "This character has no alternate greeting to use as the next scene.",
       character.name || "",
+      {
+        chat: activeChat,
+        character,
+        inspectorEnabled,
+      },
     );
   }
 
@@ -741,6 +786,7 @@ async function loadState(options = {}) {
     activeIndex,
     upcomingIndex,
     autoInject,
+    inspectorEnabled,
     busyAction: getBusyAction(),
     sync: null,
   };
@@ -999,6 +1045,26 @@ function buildStyles() {
   border-color: var(--lumiverse-danger, #dc2626);
 }
 
+.ls-gi-power-button {
+  width: 100%;
+  min-height: 36px;
+  font-size: 13px;
+  font-weight: 750;
+  letter-spacing: 0;
+}
+
+.ls-gi-power-button-on {
+  color: #ffffff;
+  background: #15803d;
+  border-color: #166534;
+}
+
+.ls-gi-power-button-off {
+  color: #ffffff;
+  background: #dc2626;
+  border-color: #b91c1c;
+}
+
 .ls-gi-refresh-button {
   min-width: 82px;
 }
@@ -1203,6 +1269,24 @@ function refreshButtonHtml(id, busyAction) {
   return `<button class="ls-gi-button ls-gi-button-secondary ls-gi-refresh-button" id="${id}" data-action="refresh" type="button" title="Refresh Greeting Inspector for the active chat"${disabled}>${spinnerHtml(busy)}<span>Refresh</span></button>`;
 }
 
+function powerButtonHtml(state, busyAction) {
+  if (!state.character) {
+    return "";
+  }
+
+  const enabled = state.inspectorEnabled !== false;
+  const label = enabled ? "ON" : "OFF";
+  const className =
+    enabled ? "ls-gi-power-button-on" : "ls-gi-power-button-off";
+  const disabled = busyAction ? ' disabled aria-disabled="true"' : "";
+  const title =
+    enabled ?
+      "Turn Greeting Inspector off for this character"
+    : "Turn Greeting Inspector on for this character";
+
+  return `<button class="ls-gi-button ls-gi-power-button ${className}" id="ls-gi-power-toggle" data-action="powerToggle" type="button" title="${title}"${disabled}><span>${label}</span></button>`;
+}
+
 function indexLabel(greeting) {
   return greeting ? `${greeting.index} (${greeting.label})` : "none";
 }
@@ -1211,13 +1295,15 @@ function buildDrawerHtml(state) {
   const busyAction = getBusyAction();
 
   if (!state.ready) {
+    const statusValue = state.inspectorEnabled === false ? "Off" : "Inactive";
     return `
 <div class="ls-gi-root">
+  ${powerButtonHtml(state, busyAction)}
   <div class="ls-gi-status">
     <div class="ls-gi-status-top">
       <div>
         <div class="ls-gi-kicker">Greeting Inspector</div>
-        <div class="ls-gi-value">Inactive</div>
+        <div class="ls-gi-value">${statusValue}</div>
       </div>
       <div class="ls-gi-button-row">${refreshButtonHtml("ls-gi-drawer-refresh", busyAction)}</div>
     </div>
@@ -1241,6 +1327,7 @@ function buildDrawerHtml(state) {
 
   return `
 <div class="ls-gi-root">
+  ${powerButtonHtml(state, busyAction)}
   <div class="ls-gi-status">
     <div class="ls-gi-status-top">
       <div>
@@ -2124,6 +2211,37 @@ async function handleAutoPromptChange(checked) {
   );
 }
 
+async function handlePowerToggle() {
+  const state = await loadState();
+  if (!state.character) {
+    api.ui.toast("Open a character chat before changing Greeting Inspector.", "warning");
+    return;
+  }
+
+  const nextEnabled = state.inspectorEnabled === false;
+  const characterName = state.character.name || "(unnamed)";
+
+  setBusyAction("powerToggle");
+  try {
+    await writeInspectorEnabled(nextEnabled);
+    logDebug("inspector enabled toggled", {
+      enabled: nextEnabled,
+      character: characterName,
+    });
+  } finally {
+    setBusyAction("");
+  }
+
+  const refreshedState = await refreshPipeline({
+    reason: nextEnabled ? "character enabled" : "character disabled",
+  });
+
+  api.ui.toast(
+    `Greeting Inspector ${nextEnabled ? "ON" : "OFF"} for ${characterName}.`,
+    refreshedState.sync && refreshedState.sync.error ? "warning" : "success",
+  );
+}
+
 async function handleUiAction(action, options = {}) {
   try {
     logDebug("ui action", { action, source: options.source || "" });
@@ -2155,6 +2273,11 @@ async function handleUiAction(action, options = {}) {
 
     if (action === "autoPrompt") {
       await handleAutoPromptChange(Boolean(options.checked));
+      return;
+    }
+
+    if (action === "powerToggle") {
+      await handlePowerToggle();
     }
   } catch (error) {
     const message = error.message || String(error);
