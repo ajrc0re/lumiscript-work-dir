@@ -36,16 +36,24 @@ const USER_OVERRIDE_MARKER = "--O--";
 const DRAWER_TAB_KEY = "__greetingInspectorDrawerTabV3";
 const DRAWER_CLICK_UNSUB_KEY = "__greetingInspectorDrawerClickUnsubV3";
 const DRAWER_CHANGE_UNSUB_KEY = "__greetingInspectorDrawerChangeUnsubV3";
+const FLOATING_HANDLE_KEY = "__greetingInspectorFloatingHandleV3";
 const FLOATING_CLICK_UNSUB_KEY = "__greetingInspectorFloatingClickUnsubV3";
+const FLOATING_POINTER_UNSUB_KEY = "__greetingInspectorFloatingPointerUnsubV3";
+const FLOATING_POINTER_START_KEY = "__greetingInspectorFloatingPointerStartV3";
 const BUSY_ACTION_KEY = "__greetingInspectorBusyActionV3";
 const TRANSITION_IN_FLIGHT_KEY = "__greetingInspectorTransitionInFlightV3";
 const DEBUG_LOG_KEY = "__greetingInspectorDebugLogV3";
+const REFRESH_REVISION_KEY = "__greetingInspectorRefreshRevisionV3";
+const STYLES_READY_KEY = "__greetingInspectorStylesReadyV3";
 
 const MAX_DEBUG_LOG_LINES = 96;
 const CHAT_SWITCH_SETTLE_ATTEMPTS = 24;
 const CHAT_SWITCH_SETTLE_DELAY_MS = 125;
 const LATEST_MESSAGE_RETRY_ATTEMPTS = 10;
 const LATEST_MESSAGE_RETRY_DELAY_MS = 150;
+const MACRO_RACE_RETRY_ATTEMPTS = 5;
+const MACRO_RACE_INITIAL_DELAY_MS = 15;
+const DRAG_CLICK_DISTANCE_PX = 6;
 
 const CONTEXT_REFRESH_EVENTS = new Set([
   "ls:startup",
@@ -373,15 +381,59 @@ function setBusyAction(action) {
   globalThis[BUSY_ACTION_KEY] = asText(action);
 }
 
+function nextRefreshRevision() {
+  const revision = (Number(globalThis[REFRESH_REVISION_KEY]) || 0) + 1;
+  globalThis[REFRESH_REVISION_KEY] = revision;
+  return revision;
+}
+
+function isCurrentRefreshRevision(revision) {
+  return Number(globalThis[REFRESH_REVISION_KEY]) === revision;
+}
+
 function clearCachedHandles() {
   globalThis[DRAWER_TAB_KEY] = null;
   globalThis[DRAWER_CLICK_UNSUB_KEY] = null;
   globalThis[DRAWER_CHANGE_UNSUB_KEY] = null;
+  globalThis[FLOATING_HANDLE_KEY] = null;
   globalThis[FLOATING_CLICK_UNSUB_KEY] = null;
+  globalThis[FLOATING_POINTER_UNSUB_KEY] = null;
+  globalThis[FLOATING_POINTER_START_KEY] = null;
+  globalThis[STYLES_READY_KEY] = false;
 }
 
 async function sleep(ms) {
   await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isMacroRaceError(error) {
+  return String(error && error.message ? error.message : error).includes(
+    "non-committing macro resolution",
+  );
+}
+
+async function retryOnMacroRace(operation, label) {
+  let delayMs = MACRO_RACE_INITIAL_DELAY_MS;
+
+  for (let attempt = 0; attempt < MACRO_RACE_RETRY_ATTEMPTS; attempt++) {
+    try {
+      return await operation();
+    } catch (error) {
+      if (!isMacroRaceError(error) || attempt === MACRO_RACE_RETRY_ATTEMPTS - 1) {
+        throw error;
+      }
+
+      logDebug("mutation delayed during prompt preview", {
+        label,
+        attempt: attempt + 1,
+        delayMs,
+      });
+      await sleep(delayMs);
+      delayMs *= 2;
+    }
+  }
+
+  return undefined;
 }
 
 async function getActiveChat() {
@@ -430,13 +482,25 @@ async function waitForActiveChat(expectedChatId) {
   return activeChat;
 }
 
+async function ensureActiveChatStill(chatId, action) {
+  const expectedId = asText(chatId);
+  if (!expectedId) {
+    return;
+  }
+
+  const activeChat = await getActiveChat();
+  if (!activeChat || activeChat.id !== expectedId) {
+    throw new Error(`${action} cancelled because the active chat changed; refresh and try again.`);
+  }
+}
+
 async function deleteVariable(store, key) {
   if (!store || typeof store.delete !== "function") {
     return false;
   }
 
   try {
-    return await store.delete(key);
+    return await retryOnMacroRace(() => store.delete(key), `delete ${key}`);
   } catch (error) {
     logDebug("variable delete failed", { key, error: error.message || String(error) });
     return false;
@@ -474,12 +538,18 @@ async function setVariable(store, key, value) {
   }
 
   try {
-    await store.set(key, value);
+    await retryOnMacroRace(() => store.set(key, value), `set ${key}`);
     logDebug("variable written", { key, value: debugPreview(value, 80) });
     return true;
   } catch (error) {
     logDebug("variable write failed", { key, error: error.message || String(error) });
     return false;
+  }
+}
+
+function requireVariableWrite(success, key) {
+  if (!success) {
+    throw new Error(`Could not persist ${key}; refresh before trying again.`);
   }
 }
 
@@ -505,22 +575,50 @@ async function readChatVariable(key, fallback) {
   return value;
 }
 
-async function writeChatVariable(key, value) {
-  await setVariable(api.variables.chat, key, value);
+async function writeChatVariable(key, value, options = {}) {
+  const required = Boolean(options.required);
+  const wrote = await setVariable(api.variables.chat, key, value);
+
+  if (required) {
+    requireVariableWrite(wrote, key);
+  }
 
   const oldKey = oldChatVariableKey(key);
   if (oldKey) {
     await deleteVariable(api.variables.chat, oldKey);
   }
+
+  return wrote;
 }
 
-async function deleteChatVariable(key) {
+async function deleteChatVariable(key, options = {}) {
+  const required = Boolean(options.required);
   await deleteVariable(api.variables.chat, key);
 
   const oldKey = oldChatVariableKey(key);
   if (oldKey) {
     await deleteVariable(api.variables.chat, oldKey);
   }
+
+  const success =
+    !(await hasVariable(api.variables.chat, key)) &&
+    (!oldKey || !(await hasVariable(api.variables.chat, oldKey)));
+
+  if (required) {
+    requireVariableWrite(success, key);
+  }
+
+  return success;
+}
+
+async function confirmChatVariable(key, expectedValue, normalize) {
+  if (!(await hasVariable(api.variables.chat, key))) {
+    return false;
+  }
+
+  const stored = await getVariable(api.variables.chat, key, null);
+  const normalized = normalize ? normalize(stored) : stored;
+  return normalized === expectedValue;
 }
 
 async function clearRemovedSequenceVariables() {
@@ -560,7 +658,18 @@ async function readActiveIndex(greetings, persist = true) {
 
 async function writeActiveIndex(activeIndex, greetings) {
   const clampedIndex = clampIndex(activeIndex, greetings.length - 1);
-  await writeChatVariable(ACTIVE_INDEX_VAR, clampedIndex);
+  await writeChatVariable(ACTIVE_INDEX_VAR, clampedIndex, { required: true });
+
+  const confirmed = await confirmChatVariable(
+    ACTIVE_INDEX_VAR,
+    clampedIndex,
+    (value) => clampIndex(value, greetings.length - 1),
+  );
+
+  if (!confirmed) {
+    throw new Error(`Could not confirm ${ACTIVE_INDEX_VAR}; refresh before trying again.`);
+  }
+
   return clampedIndex;
 }
 
@@ -595,15 +704,42 @@ async function writeUpcomingIndex(upcomingIndex, activeIndex, greetings) {
     const fallbackIndex = defaultUpcomingIndex(activeIndex, greetings);
 
     if (fallbackIndex === null) {
-      await deleteChatVariable(UPCOMING_INDEX_VAR);
+      await deleteChatVariable(UPCOMING_INDEX_VAR, { required: true });
+
+      if (await hasVariable(api.variables.chat, UPCOMING_INDEX_VAR)) {
+        throw new Error(`Could not clear ${UPCOMING_INDEX_VAR}; refresh before trying again.`);
+      }
+
       return null;
     }
 
-    await writeChatVariable(UPCOMING_INDEX_VAR, fallbackIndex);
+    await writeChatVariable(UPCOMING_INDEX_VAR, fallbackIndex, { required: true });
+
+    const fallbackConfirmed = await confirmChatVariable(
+      UPCOMING_INDEX_VAR,
+      fallbackIndex,
+      (value) => normalizeUpcomingIndex(value, activeIndex, greetings),
+    );
+
+    if (!fallbackConfirmed) {
+      throw new Error(`Could not confirm ${UPCOMING_INDEX_VAR}; refresh before trying again.`);
+    }
+
     return fallbackIndex;
   }
 
-  await writeChatVariable(UPCOMING_INDEX_VAR, normalizedIndex);
+  await writeChatVariable(UPCOMING_INDEX_VAR, normalizedIndex, { required: true });
+
+  const confirmed = await confirmChatVariable(
+    UPCOMING_INDEX_VAR,
+    normalizedIndex,
+    (value) => normalizeUpcomingIndex(value, activeIndex, greetings),
+  );
+
+  if (!confirmed) {
+    throw new Error(`Could not confirm ${UPCOMING_INDEX_VAR}; refresh before trying again.`);
+  }
+
   return normalizedIndex;
 }
 
@@ -611,11 +747,27 @@ async function resetUpcomingIndex(activeIndex, greetings) {
   const fallbackIndex = defaultUpcomingIndex(activeIndex, greetings);
 
   if (fallbackIndex === null) {
-    await deleteChatVariable(UPCOMING_INDEX_VAR);
+    await deleteChatVariable(UPCOMING_INDEX_VAR, { required: true });
+
+    if (await hasVariable(api.variables.chat, UPCOMING_INDEX_VAR)) {
+      throw new Error(`Could not clear ${UPCOMING_INDEX_VAR}; refresh before trying again.`);
+    }
+
     return null;
   }
 
-  await writeChatVariable(UPCOMING_INDEX_VAR, fallbackIndex);
+  await writeChatVariable(UPCOMING_INDEX_VAR, fallbackIndex, { required: true });
+
+  const confirmed = await confirmChatVariable(
+    UPCOMING_INDEX_VAR,
+    fallbackIndex,
+    (value) => normalizeUpcomingIndex(value, activeIndex, greetings),
+  );
+
+  if (!confirmed) {
+    throw new Error(`Could not confirm ${UPCOMING_INDEX_VAR}; refresh before trying again.`);
+  }
+
   return fallbackIndex;
 }
 
@@ -634,7 +786,15 @@ async function readAutoInject(persist = true) {
 
 async function writeAutoInject(enabled) {
   const normalizedValue = Boolean(enabled);
-  await setVariable(api.variables.character, AUTO_INJECT_VAR, normalizedValue);
+  const wrote = await setVariable(api.variables.character, AUTO_INJECT_VAR, normalizedValue);
+  requireVariableWrite(wrote, AUTO_INJECT_VAR);
+
+  const storedExists = await hasVariable(api.variables.character, AUTO_INJECT_VAR);
+  const stored = await getVariable(api.variables.character, AUTO_INJECT_VAR, null);
+  if (!storedExists || asBoolean(stored) !== normalizedValue) {
+    throw new Error(`Could not confirm ${AUTO_INJECT_VAR}; refresh before trying again.`);
+  }
+
   return normalizedValue;
 }
 
@@ -653,7 +813,15 @@ async function readInspectorEnabled(persist = true) {
 
 async function writeInspectorEnabled(enabled) {
   const normalizedValue = Boolean(enabled);
-  await setVariable(api.variables.character, ENABLED_VAR, normalizedValue);
+  const wrote = await setVariable(api.variables.character, ENABLED_VAR, normalizedValue);
+  requireVariableWrite(wrote, ENABLED_VAR);
+
+  const storedExists = await hasVariable(api.variables.character, ENABLED_VAR);
+  const stored = await getVariable(api.variables.character, ENABLED_VAR, null);
+  if (!storedExists || asBoolean(stored) !== normalizedValue) {
+    throw new Error(`Could not confirm ${ENABLED_VAR}; refresh before trying again.`);
+  }
+
   return normalizedValue;
 }
 
@@ -1171,8 +1339,9 @@ function buildStyles() {
 
 .ls-gi-floating-root {
   position: fixed;
-  right: 18px;
-  bottom: 18px;
+  left: 0;
+  right: auto;
+  bottom: 0;
   z-index: 2147483646;
 }
 
@@ -1377,10 +1546,7 @@ function buildDrawerHtml(state) {
 }
 
 function buildFloatingRefreshHtml() {
-  return `
-<div class="ls-gi-floating-root">
-  ${refreshButtonHtml("ls-gi-floating-refresh", getBusyAction())}
-</div>`;
+  return `<div class="ls-gi-floating-root">${refreshButtonHtml("ls-gi-floating-refresh", getBusyAction())}</div>`;
 }
 
 function drawerTabIconSvg() {
@@ -1400,10 +1566,16 @@ async function ensureStyles() {
     return false;
   }
 
+  if (globalThis[STYLES_READY_KEY]) {
+    return true;
+  }
+
   try {
     await api.ui.dom.addStyle(buildStyles(), { id: STYLE_ID });
+    globalThis[STYLES_READY_KEY] = true;
     return true;
   } catch (error) {
+    globalThis[STYLES_READY_KEY] = false;
     logDebug("style injection failed", { error: error.message || String(error) });
     return false;
   }
@@ -1505,33 +1677,90 @@ async function renderDrawer(state) {
   }
 }
 
+async function attachFloatingRefreshHandlers(handle) {
+  unsubscribeByKey(FLOATING_CLICK_UNSUB_KEY);
+  unsubscribeByKey(FLOATING_POINTER_UNSUB_KEY);
+
+  globalThis[FLOATING_POINTER_UNSUB_KEY] = handle.on(
+    "pointerdown",
+    async (event) => {
+      globalThis[FLOATING_POINTER_START_KEY] = {
+        x: Number(event && event.clientX) || 0,
+        y: Number(event && event.clientY) || 0,
+      };
+    },
+  );
+
+  globalThis[FLOATING_CLICK_UNSUB_KEY] = handle.on(
+    "click",
+    async (event) => {
+      if (actionFromEvent(event) !== "refresh") {
+        return;
+      }
+
+      const start = globalThis[FLOATING_POINTER_START_KEY];
+      globalThis[FLOATING_POINTER_START_KEY] = null;
+
+      if (start) {
+        const dx = (Number(event && event.clientX) || 0) - start.x;
+        const dy = (Number(event && event.clientY) || 0) - start.y;
+        const distance = Math.sqrt(dx * dx + dy * dy);
+
+        if (distance > DRAG_CLICK_DISTANCE_PX) {
+          logDebug("floating refresh click ignored after drag", {
+            distance: Math.round(distance),
+          });
+          return;
+        }
+      }
+
+      await handleUiAction("refresh", { source: "floating" });
+    },
+    { preventDefault: true },
+  );
+}
+
 async function renderFloatingRefresh() {
   if (!api.ui || !api.ui.dom || typeof api.ui.dom.inject !== "function") {
     return;
   }
 
   try {
-    const handle = await api.ui.dom.inject("body", buildFloatingRefreshHtml(), {
+    let handle = globalThis[FLOATING_HANDLE_KEY];
+
+    if (handle && typeof handle.read === "function") {
+      let snapshot = null;
+      try {
+        snapshot = await handle.read();
+      } catch (error) {
+        logDebug("floating refresh handle read failed", {
+          error: error.message || String(error),
+        });
+      }
+
+      if (!snapshot) {
+        handle = null;
+        globalThis[FLOATING_HANDLE_KEY] = null;
+      }
+    }
+
+    if (handle && typeof handle.update === "function") {
+      await handle.update(buildFloatingRefreshHtml());
+      logDebug("floating refresh updated", { busy: getBusyAction() || "none" });
+      return;
+    }
+
+    handle = await api.ui.dom.inject("body", buildFloatingRefreshHtml(), {
       id: FLOATING_REFRESH_ID,
       position: "beforeend",
     });
+    globalThis[FLOATING_HANDLE_KEY] = handle;
 
     if (handle && typeof handle.makeDraggable === "function") {
       handle.makeDraggable(".ls-gi-refresh-button");
     }
 
-    unsubscribeByKey(FLOATING_CLICK_UNSUB_KEY);
-    globalThis[FLOATING_CLICK_UNSUB_KEY] = handle.on(
-      "click",
-      async (event) => {
-        if (actionFromEvent(event) !== "refresh") {
-          return;
-        }
-
-        await handleUiAction("refresh", { source: "floating" });
-      },
-      { preventDefault: true },
-    );
+    await attachFloatingRefreshHandlers(handle);
     logDebug("floating refresh rendered", { busy: getBusyAction() || "none" });
   } catch (error) {
     logDebug("floating refresh render failed", { error: error.message || String(error) });
@@ -1921,6 +2150,8 @@ async function advanceToUpcomingGreeting(state, source = "manual") {
   const advancedIndex =
     normalizeUpcomingIndex(state.upcomingIndex, state.activeIndex, state.greetings) ??
     defaultUpcomingIndex(state.activeIndex, state.greetings);
+  const previousActiveIndex = state.activeIndex;
+  const previousUpcomingIndex = state.upcomingIndex;
 
   logDebug("advance requested", {
     source,
@@ -1938,9 +2169,29 @@ async function advanceToUpcomingGreeting(state, source = "manual") {
     };
   }
 
+  state.activeIndex = await writeActiveIndex(advancedIndex, state.greetings);
+  state.upcomingIndex = await resetUpcomingIndex(state.activeIndex, state.greetings);
+
+  logDebug("advance state committed before insert", {
+    activeIndex: state.activeIndex,
+    upcomingIndex: state.upcomingIndex === null ? "none" : state.upcomingIndex,
+  });
+
   const insertedGreeting = await insertGreetingMessage(state.greetings[advancedIndex]);
 
   if (!insertedGreeting) {
+    state.activeIndex = await writeActiveIndex(previousActiveIndex, state.greetings);
+    state.upcomingIndex = await writeUpcomingIndex(
+      previousUpcomingIndex,
+      state.activeIndex,
+      state.greetings,
+    );
+
+    logDebug("advance rolled back after insert failure", {
+      activeIndex: state.activeIndex,
+      upcomingIndex: state.upcomingIndex === null ? "none" : state.upcomingIndex,
+    });
+
     return {
       advancedIndex: null,
       attemptedIndex: advancedIndex,
@@ -1948,9 +2199,6 @@ async function advanceToUpcomingGreeting(state, source = "manual") {
       insertionFailed: true,
     };
   }
-
-  state.activeIndex = await writeActiveIndex(advancedIndex, state.greetings);
-  state.upcomingIndex = await resetUpcomingIndex(state.activeIndex, state.greetings);
 
   logDebug("advance committed", {
     activeIndex: state.activeIndex,
@@ -2021,6 +2269,7 @@ function nextGreetingMessage(state) {
 }
 
 async function refreshPipeline(options = {}) {
+  const revision = nextRefreshRevision();
   const eventName = asText(options.eventName);
   const expectedChatId = asText(options.expectedChatId);
   const strictChat = Boolean(options.strictChat);
@@ -2033,6 +2282,7 @@ async function refreshPipeline(options = {}) {
     expectedChatId,
     strictChat,
     processTransition: Boolean(options.processTransition),
+    revision,
   });
 
   let state = await loadState({ expectedChatId, strictChat });
@@ -2042,6 +2292,11 @@ async function refreshPipeline(options = {}) {
   }
 
   if (!state.ready) {
+    if (!isCurrentRefreshRevision(revision)) {
+      logDebug("refresh pipeline skipped stale inactive render", { reason, revision });
+      return state;
+    }
+
     await syncNextSceneContext(state);
     await renderUi(state);
 
@@ -2055,6 +2310,22 @@ async function refreshPipeline(options = {}) {
   let transitionResult = null;
   if (options.processTransition) {
     transitionResult = await maybeAdvanceForTransition(state, eventName);
+  }
+
+  if (transitionResult && transitionResult.result && !transitionResult.result.insertionFailed) {
+    const refreshedState = await loadState({
+      expectedChatId: state.chat && state.chat.id,
+      strictChat: true,
+    });
+
+    if (!refreshedState.staleEvent) {
+      state = refreshedState;
+    }
+  }
+
+  if (!isCurrentRefreshRevision(revision)) {
+    logDebug("refresh pipeline skipped stale render", { reason, revision });
+    return state;
   }
 
   state.sync = await syncNextSceneContext(state);
@@ -2121,14 +2392,19 @@ async function handleActivePicker() {
     return;
   }
 
-  state.activeIndex = await writeActiveIndex(selectedIndex, state.greetings);
-  state.upcomingIndex = await resetUpcomingIndex(state.activeIndex, state.greetings);
-  state.sync = await syncNextSceneContext(state);
-  await renderUi(state);
+  await ensureActiveChatStill(state.chat && state.chat.id, "Active greeting change");
+  const committedActiveIndex = await writeActiveIndex(selectedIndex, state.greetings);
+  await resetUpcomingIndex(committedActiveIndex, state.greetings);
+
+  const refreshedState = await refreshPipeline({ reason: "active picker committed" });
+  if (!refreshedState.ready) {
+    api.ui.toast(refreshedState.reason || "Greeting Inspector is inactive.", "warning");
+    return;
+  }
 
   api.ui.toast(
-    `Active greeting set to ${state.activeIndex} (${state.greetings[state.activeIndex].label}). ${nextGreetingMessage(state)} ${promptContentMessage(state.sync)}`,
-    state.sync && state.sync.error ? "warning" : "success",
+    `Active greeting set to ${refreshedState.activeIndex} (${refreshedState.greetings[refreshedState.activeIndex].label}). ${nextGreetingMessage(refreshedState)} ${promptContentMessage(refreshedState.sync)}`,
+    refreshedState.sync && refreshedState.sync.error ? "warning" : "success",
   );
 }
 
@@ -2145,22 +2421,27 @@ async function handleUpcomingPicker() {
     return;
   }
 
-  state.upcomingIndex = await writeUpcomingIndex(
+  await ensureActiveChatStill(state.chat && state.chat.id, "Next greeting change");
+  await writeUpcomingIndex(
     selectedIndex,
     state.activeIndex,
     state.greetings,
   );
-  state.sync = await syncNextSceneContext(state);
-  await renderUi(state);
 
-  if (state.upcomingIndex === null) {
+  const refreshedState = await refreshPipeline({ reason: "next picker committed" });
+  if (!refreshedState.ready) {
+    api.ui.toast(refreshedState.reason || "Greeting Inspector is inactive.", "warning");
+    return;
+  }
+
+  if (refreshedState.upcomingIndex === null) {
     api.ui.toast("There is no later greeting to use as the next greeting.", "warning");
     return;
   }
 
   api.ui.toast(
-    `Next greeting set to ${state.upcomingIndex} (${state.greetings[state.upcomingIndex].label}). ${promptContentMessage(state.sync)}`,
-    state.sync && state.sync.error ? "warning" : "success",
+    `Next greeting set to ${refreshedState.upcomingIndex} (${refreshedState.greetings[refreshedState.upcomingIndex].label}). ${promptContentMessage(refreshedState.sync)}`,
+    refreshedState.sync && refreshedState.sync.error ? "warning" : "success",
   );
 }
 
@@ -2171,9 +2452,9 @@ async function handleForceAdvance() {
     return;
   }
 
+  await ensureActiveChatStill(state.chat && state.chat.id, "Force transition");
   const result = await advanceToUpcomingGreeting(state, "force");
-  state.sync = await syncNextSceneContext(state);
-  await renderUi(state);
+  const refreshedState = await refreshPipeline({ reason: "force complete" });
 
   if (result.insertionFailed) {
     api.ui.toast(
@@ -2188,9 +2469,14 @@ async function handleForceAdvance() {
     return;
   }
 
+  if (!refreshedState.ready) {
+    api.ui.toast(refreshedState.reason || "Greeting Inspector is inactive.", "warning");
+    return;
+  }
+
   api.ui.toast(
-    `Forced greeting transition to ${result.advancedIndex} (${state.greetings[result.advancedIndex].label}). ${nextGreetingMessage(state)} ${promptContentMessage(state.sync)}`,
-    state.sync && state.sync.error ? "warning" : "success",
+    `Forced greeting transition to ${result.advancedIndex} (${refreshedState.greetings[result.advancedIndex].label}). ${nextGreetingMessage(refreshedState)} ${promptContentMessage(refreshedState.sync)}`,
+    refreshedState.sync && refreshedState.sync.error ? "warning" : "success",
   );
 }
 
@@ -2201,13 +2487,17 @@ async function handleAutoPromptChange(checked) {
     return;
   }
 
-  state.autoInject = await writeAutoInject(checked);
-  state.sync = await syncNextSceneContext(state);
-  await renderUi(state);
+  await writeAutoInject(checked);
+  const refreshedState = await refreshPipeline({ reason: "auto prompt committed" });
+
+  if (!refreshedState.ready) {
+    api.ui.toast(refreshedState.reason || "Greeting Inspector is inactive.", "warning");
+    return;
+  }
 
   api.ui.toast(
-    `Auto prompt ${state.autoInject ? "enabled" : "disabled"}. ${promptContentMessage(state.sync)}`,
-    state.sync && state.sync.error ? "warning" : "success",
+    `Auto prompt ${refreshedState.autoInject ? "enabled" : "disabled"}. ${promptContentMessage(refreshedState.sync)}`,
+    refreshedState.sync && refreshedState.sync.error ? "warning" : "success",
   );
 }
 
@@ -2330,6 +2620,13 @@ async function main() {
 
   if (eventName === "ls:startup" || eventName === "ls:reload") {
     clearCachedHandles();
+    try {
+      if (api.ui && api.ui.dom && typeof api.ui.dom.cleanup === "function") {
+        await api.ui.dom.cleanup();
+      }
+    } catch (error) {
+      logDebug("startup dom cleanup failed", { error: error.message || String(error) });
+    }
   }
 
   if (isTeardown(eventName)) {
