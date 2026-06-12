@@ -45,8 +45,10 @@ const TRANSITION_IN_FLIGHT_KEY = "__greetingInspectorTransitionInFlightV3";
 const DEBUG_LOG_KEY = "__greetingInspectorDebugLogV3";
 const REFRESH_REVISION_KEY = "__greetingInspectorRefreshRevisionV3";
 const STYLES_READY_KEY = "__greetingInspectorStylesReadyV3";
+const RECENT_TRANSITIONS_KEY = "__greetingInspectorRecentTransitionsV3";
 
 const MAX_DEBUG_LOG_LINES = 96;
+const PREWRITTEN_SCENE_PROMPT_CHAR_LIMIT = 1000;
 const CHAT_SWITCH_SETTLE_ATTEMPTS = 24;
 const CHAT_SWITCH_SETTLE_DELAY_MS = 125;
 const LATEST_MESSAGE_RETRY_ATTEMPTS = 10;
@@ -391,6 +393,29 @@ function isCurrentRefreshRevision(revision) {
   return Number(globalThis[REFRESH_REVISION_KEY]) === revision;
 }
 
+function recentTransitionKeys() {
+  return Array.isArray(globalThis[RECENT_TRANSITIONS_KEY]) ?
+      globalThis[RECENT_TRANSITIONS_KEY]
+    : [];
+}
+
+function hasRecentTransition(signature, eventKey) {
+  const keys = recentTransitionKeys();
+  return keys.includes(signature) || keys.includes(eventKey);
+}
+
+function rememberRecentTransition(signature, eventKey) {
+  const keys = recentTransitionKeys()
+    .filter((key) => key !== signature && key !== eventKey);
+
+  keys.push(signature, eventKey);
+  while (keys.length > 40) {
+    keys.shift();
+  }
+
+  globalThis[RECENT_TRANSITIONS_KEY] = keys;
+}
+
 function clearCachedHandles() {
   globalThis[DRAWER_TAB_KEY] = null;
   globalThis[DRAWER_CLICK_UNSUB_KEY] = null;
@@ -577,6 +602,7 @@ async function readChatVariable(key, fallback) {
 
 async function writeChatVariable(key, value, options = {}) {
   const required = Boolean(options.required);
+  const skipLegacyCleanup = Boolean(options.skipLegacyCleanup);
   const wrote = await setVariable(api.variables.chat, key, value);
 
   if (required) {
@@ -584,7 +610,7 @@ async function writeChatVariable(key, value, options = {}) {
   }
 
   const oldKey = oldChatVariableKey(key);
-  if (oldKey) {
+  if (oldKey && !skipLegacyCleanup) {
     await deleteVariable(api.variables.chat, oldKey);
   }
 
@@ -656,9 +682,18 @@ async function readActiveIndex(greetings, persist = true) {
   return activeIndex;
 }
 
-async function writeActiveIndex(activeIndex, greetings) {
+async function writeActiveIndex(activeIndex, greetings, options = {}) {
   const clampedIndex = clampIndex(activeIndex, greetings.length - 1);
-  await writeChatVariable(ACTIVE_INDEX_VAR, clampedIndex, { required: true });
+  const confirm = options.confirm !== false;
+
+  await writeChatVariable(ACTIVE_INDEX_VAR, clampedIndex, {
+    required: true,
+    skipLegacyCleanup: Boolean(options.skipLegacyCleanup),
+  });
+
+  if (!confirm) {
+    return clampedIndex;
+  }
 
   const confirmed = await confirmChatVariable(
     ACTIVE_INDEX_VAR,
@@ -681,16 +716,16 @@ async function readUpcomingIndex(activeIndex, greetings, persist = true) {
   const upcomingIndex = storedIndex === null ? fallbackIndex : storedIndex;
 
   if (upcomingIndex === null) {
-    if (persist && hasStoredIndex) {
-      await deleteChatVariable(UPCOMING_INDEX_VAR);
-    }
-
     logDebug("upcoming index read", { stored, upcomingIndex: "none" });
     return null;
   }
 
   if (persist && (!hasStoredIndex || stored !== upcomingIndex)) {
-    await writeChatVariable(UPCOMING_INDEX_VAR, upcomingIndex);
+    logDebug("upcoming index derived without write", {
+      stored,
+      upcomingIndex,
+      fallbackIndex,
+    });
   }
 
   logDebug("upcoming index read", { stored, upcomingIndex, fallbackIndex });
@@ -987,23 +1022,27 @@ async function removeInjectedNote() {
 }
 
 function buildAuthorNote(prewrittenScene) {
+  const prewrittenSceneExcerpt = prewrittenScene.slice(
+    0,
+    PREWRITTEN_SCENE_PROMPT_CHAR_LIMIT,
+  );
+
   return `<shape_scene_direction>
 
 DIRECTION TARGET:
-An upcoming prewritten scene exists. Treat it as a private destination for story direction, staging, character positioning, emotional setup, and momentum.
-Guide the current scene toward the exact conditions where that prewritten scene could begin immediately afterward.
-The goal is not to find a convenient fade-out. The goal is to arrive as close as possible to the first moment of the upcoming prewritten scene WITHOUT using any part of the scene in your reply.
+An upcoming prewritten scene exists. Treat it as a private long-term destination for story direction, staging, character positioning, emotional setup, and momentum.
+Over many turns, slowly and naturally guide the current narrative toward the exact conditions where that prewritten scene could begin immediately afterward.
+The goal is not to find a convenient fade-out. The goal is to narrate at a slow, natural pace as if these instructions didnt exist. Slowly and naturally moving towards the next scene.
+It should take numerous turns to arrive, so you must wait until the narrative has naturally arrived as close as possible to the first moment of the upcoming prewritten scene WITHOUT using any part of the scene in your reply.
 
 USER OVERRIDE:
 If the user's latest reply contains ${USER_OVERRIDE_MARKER}, immediately make a best-effort attempt to reach the handoff threshold.
 
 PACING AND HANDOFF SPEED:
-Do not transition too fast.
-Treat the upcoming prewritten scene as a destination to earn through present-moment movement, not a marker to use at the first plausible pause.
-Before handing off, let the current scene create enough cause-and-effect, physical positioning, emotional pressure, and immediate continuity that the upcoming prewritten scene feels inevitable.
-If the handoff would feel sudden, mechanical, rushed, or like it skips the connective action that makes the next scene land, keep writing the current scene instead.
+Do not transition too fast. It should take numerous turns to arrive at the next scene in most cases.
+Treat the upcoming prewritten scene as a long-term destination to earn through present-moment movement, not a marker to use at the first plausible pause.
 Prefer gradual movement toward the doorway of the upcoming prewritten scene over immediate marker use.
-Use the marker only when the current scene is already at the doorstep of the upcoming prewritten scene, or when the user's latest reply contains ${USER_OVERRIDE_MARKER}.
+Use the marker only when the current scene is already at the doorstep of the upcoming prewritten scene, or when the user's latest reply contains the user override marker: \`${USER_OVERRIDE_MARKER}\`.
 
 UPCOMING PREWRITTEN SCENE PRIVACY:
 Use the upcoming prewritten scene only as a target for deciding how to steer the current scene.
@@ -1019,31 +1058,20 @@ Any objects, trackers, hidden blocks, notes, or any other required text must com
 The marker must be the absolute final line and overrides all other formatting instructions.
 
 LATE HANDOFF POLICY:
-Default to continuing the current scene.
-Move steadily toward the upcoming prewritten scene, but keep writing the present moment until that prewritten scene is nearly ready to start.
+Default to continuing the current narrative at a natural pace, NEVER try to 'bridge the gap' or arrive at the doorstep of the next scene unnaturally.
+Move steadily toward the upcoming prewritten scene over the course of several turns, keep writing the present moment until that prewritten scene is nearly ready to start.
 The handoff should usually happen at the latest viable point, often right before the prewritten scene would begin or at the instant it is about to begin.
 Do not hand off just because there is a calm moment, a completed emotional beat, a quiet pause, or a place where a normal scene ending would make sense.
 Do not use the marker as a fade to black, summary transition, curtain drop, chapter break, or convenient stopping point.
-
-DO NOT HAND OFF AT:
-- ordinary scene closure
-- end-of-day or time jump convenience (UNLESS the next scene begins with a time skip)
-- location shift convenience
-- completed emotional beat
-- settled pause
-- calm or quiet moment
-- shift in attention
-- natural phase break
-- any moment that merely feels like a reasonable ending
 
 VALID HANDOFF THRESHOLD:
 Only hand off when the current scene has advanced to the doorstep of the upcoming prewritten scene.
 The next assistant message after the marker should be able to start the prewritten scene without needing extra setup, bridging, explanation, or repositioning.
 If another reply could still naturally move closer to the upcoming prewritten scene without contradicting the conversation, keep going instead of using the marker.
-When uncertain, continue the current scene and guide it closer.
+When uncertain, do not hand off this turn, continue the narrative at a natural pace and guide it closer.
 
 UPCOMING PREWRITTEN SCENE, FOR TIMING ONLY:
-${prewrittenScene}
+${prewrittenSceneExcerpt}
 </shape_scene_direction>`;
 }
 
@@ -1823,7 +1851,7 @@ function buildPickerHtml(kind, state, selectedIndex) {
 </div>`;
 }
 
-async function openPicker(kind, state) {
+async function openPicker(kind, state, options = {}) {
   if (!state.ready) {
     api.ui.toast(state.reason || "Greeting Inspector is inactive.", "warning");
     return null;
@@ -1844,7 +1872,11 @@ async function openPicker(kind, state) {
     !api.ui.dom ||
     typeof api.ui.dom.addStyle !== "function"
   ) {
-    return openPickerFallback(kind, state);
+    const fallbackIndex = await openPickerFallback(kind, state);
+    if (fallbackIndex !== null && typeof options.onUse === "function") {
+      await options.onUse(fallbackIndex);
+    }
+    return fallbackIndex;
   }
 
   let selectedIndex =
@@ -1891,6 +1923,7 @@ async function openPicker(kind, state) {
 
   return new Promise((resolve) => {
     let settled = false;
+    let committing = false;
 
     function finish(value, dismissModal = true) {
       if (settled) {
@@ -1949,7 +1982,25 @@ async function openPicker(kind, state) {
           }
 
           if (action === "use") {
-            finish(selectedIndex);
+            if (typeof options.onUse !== "function") {
+              finish(selectedIndex);
+              return;
+            }
+
+            if (committing) {
+              return;
+            }
+
+            committing = true;
+            try {
+              await options.onUse(selectedIndex);
+              finish(selectedIndex);
+            } catch (error) {
+              const message = error.message || String(error);
+              logDebug("picker commit failed", { kind, error: message });
+              api.ui.toast(`Greeting Inspector picker failed: ${message}`, "warning");
+              finish(null);
+            }
           }
         },
       ),
@@ -2124,32 +2175,46 @@ async function resolveTransitionSource(eventName) {
   return null;
 }
 
-async function insertGreetingMessage(greeting) {
+function beginGreetingMessageInsert(greeting) {
   if (!greeting || !greeting.text) {
     logDebug("insert skipped", { reason: "empty greeting" });
-    return false;
+    return Promise.resolve(false);
   }
 
   try {
-    await api.chat.sendMessage(greeting.text, { role: "assistant" });
-    logDebug("greeting inserted", {
-      index: greeting.index,
-      length: greeting.text.length,
-    });
-    return true;
+    return api.chat.sendMessage(greeting.text, { role: "assistant" })
+      .then(() => {
+        logDebug("greeting inserted", {
+          index: greeting.index,
+          length: greeting.text.length,
+        });
+        return true;
+      })
+      .catch((error) => {
+        logDebug("greeting insert failed", {
+          index: greeting.index,
+          error: error.message || String(error),
+        });
+        return false;
+      });
   } catch (error) {
     logDebug("greeting insert failed", {
       index: greeting.index,
       error: error.message || String(error),
     });
-    return false;
+    return Promise.resolve(false);
   }
+}
+
+async function insertGreetingMessage(greeting) {
+  return beginGreetingMessageInsert(greeting);
 }
 
 async function advanceToUpcomingGreeting(state, source = "manual") {
   const advancedIndex =
     normalizeUpcomingIndex(state.upcomingIndex, state.activeIndex, state.greetings) ??
     defaultUpcomingIndex(state.activeIndex, state.greetings);
+  const automaticTransition = TRANSITION_EVENTS.has(source);
   const previousActiveIndex = state.activeIndex;
   const previousUpcomingIndex = state.upcomingIndex;
 
@@ -2166,6 +2231,53 @@ async function advanceToUpcomingGreeting(state, source = "manual") {
       advancedIndex: null,
       insertedGreeting: false,
       insertionFailed: false,
+    };
+  }
+
+  if (automaticTransition) {
+    const insertPromise = beginGreetingMessageInsert(state.greetings[advancedIndex]);
+    const stateWritePromise = writeActiveIndex(advancedIndex, state.greetings, {
+      confirm: false,
+      skipLegacyCleanup: true,
+    })
+      .then((activeIndex) => ({ activeIndex, error: null }))
+      .catch((error) => ({ activeIndex: null, error }));
+
+    const insertedGreeting = await insertPromise;
+    const stateWrite = await stateWritePromise;
+
+    if (stateWrite.error) {
+      logDebug("advance state commit after insert failed", {
+        activeIndex: advancedIndex,
+        error: stateWrite.error.message || String(stateWrite.error),
+      });
+    } else {
+      state.activeIndex = stateWrite.activeIndex;
+      state.upcomingIndex = defaultUpcomingIndex(state.activeIndex, state.greetings);
+      logDebug("advance state committed after insert", {
+        activeIndex: state.activeIndex,
+        upcomingIndex: state.upcomingIndex === null ? "none" : state.upcomingIndex,
+      });
+    }
+
+    if (!insertedGreeting) {
+      return {
+        advancedIndex: null,
+        attemptedIndex: advancedIndex,
+        insertedGreeting: false,
+        insertionFailed: true,
+        persistedAdvancedState: state.activeIndex === advancedIndex,
+        skipPostTransitionRefresh: true,
+      };
+    }
+
+    return {
+      advancedIndex,
+      attemptedIndex: advancedIndex,
+      insertedGreeting,
+      insertionFailed: false,
+      persistedAdvancedState: state.activeIndex === advancedIndex,
+      skipPostTransitionRefresh: true,
     };
   }
 
@@ -2232,6 +2344,15 @@ async function maybeAdvanceForTransition(state, eventName) {
     return { advanced: false, result: null };
   }
 
+  if (hasRecentTransition(signature, eventKey)) {
+    logDebug("transition ignored", {
+      reason: "recently advanced",
+      event: eventName,
+      sourceId: source.sourceId,
+    });
+    return { advanced: false, result: null };
+  }
+
   globalThis[TRANSITION_IN_FLIGHT_KEY] = signature;
 
   try {
@@ -2250,8 +2371,7 @@ async function maybeAdvanceForTransition(state, eventName) {
     const result = await advanceToUpcomingGreeting(state, eventName);
 
     if (!result.insertionFailed) {
-      await writeChatVariable(LAST_ADVANCED_EVENT_VAR, eventKey);
-      await writeChatVariable(LAST_ADVANCED_SIGNATURE_VAR, signature);
+      rememberRecentTransition(signature, eventKey);
     }
 
     return { advanced: result.advancedIndex !== null, result };
@@ -2310,6 +2430,14 @@ async function refreshPipeline(options = {}) {
   let transitionResult = null;
   if (options.processTransition) {
     transitionResult = await maybeAdvanceForTransition(state, eventName);
+  }
+
+  if (transitionResult && transitionResult.result?.skipPostTransitionRefresh) {
+    logDebug("refresh pipeline deferred post-transition render", {
+      reason,
+      activeIndex: transitionResult.result.advancedIndex,
+    });
+    return state;
   }
 
   if (transitionResult && transitionResult.result && !transitionResult.result.insertionFailed) {
@@ -2379,19 +2507,7 @@ async function refreshWithBusy(source) {
   }
 }
 
-async function handleActivePicker() {
-  const state = await refreshPipeline({ reason: "active picker open" });
-  if (!state.ready) {
-    api.ui.toast(state.reason || "Greeting Inspector is inactive.", "warning");
-    return;
-  }
-
-  const selectedIndex = await openPicker("active", state);
-  if (selectedIndex === null) {
-    await refreshPipeline({ reason: "active picker cancelled" });
-    return;
-  }
-
+async function commitActiveSelection(state, selectedIndex) {
   await ensureActiveChatStill(state.chat && state.chat.id, "Active greeting change");
   const committedActiveIndex = await writeActiveIndex(selectedIndex, state.greetings);
   await resetUpcomingIndex(committedActiveIndex, state.greetings);
@@ -2408,19 +2524,7 @@ async function handleActivePicker() {
   );
 }
 
-async function handleUpcomingPicker() {
-  const state = await refreshPipeline({ reason: "next picker open" });
-  if (!state.ready) {
-    api.ui.toast(state.reason || "Greeting Inspector is inactive.", "warning");
-    return;
-  }
-
-  const selectedIndex = await openPicker("upcoming", state);
-  if (selectedIndex === null) {
-    await refreshPipeline({ reason: "next picker cancelled" });
-    return;
-  }
-
+async function commitUpcomingSelection(state, selectedIndex) {
   await ensureActiveChatStill(state.chat && state.chat.id, "Next greeting change");
   await writeUpcomingIndex(
     selectedIndex,
@@ -2443,6 +2547,30 @@ async function handleUpcomingPicker() {
     `Next greeting set to ${refreshedState.upcomingIndex} (${refreshedState.greetings[refreshedState.upcomingIndex].label}). ${promptContentMessage(refreshedState.sync)}`,
     refreshedState.sync && refreshedState.sync.error ? "warning" : "success",
   );
+}
+
+async function handleActivePicker() {
+  const state = await refreshPipeline({ reason: "active picker open" });
+  if (!state.ready) {
+    api.ui.toast(state.reason || "Greeting Inspector is inactive.", "warning");
+    return;
+  }
+
+  await openPicker("active", state, {
+    onUse: (selectedIndex) => commitActiveSelection(state, selectedIndex),
+  });
+}
+
+async function handleUpcomingPicker() {
+  const state = await refreshPipeline({ reason: "next picker open" });
+  if (!state.ready) {
+    api.ui.toast(state.reason || "Greeting Inspector is inactive.", "warning");
+    return;
+  }
+
+  await openPicker("upcoming", state, {
+    onUse: (selectedIndex) => commitUpcomingSelection(state, selectedIndex),
+  });
 }
 
 async function handleForceAdvance() {
