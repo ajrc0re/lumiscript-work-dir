@@ -1,5 +1,5 @@
 // @ls:reload-on-edit
-const VERSION = "2026-05-28-rewrite";
+const VERSION = "2026-06-16-group-chat";
 
 const INJECTION_ID = "greeting-inspector-next-scene-note";
 const DRAWER_TAB_ID = "greeting-inspector-status";
@@ -9,6 +9,8 @@ const MODAL_STYLE_ID = "greeting-inspector-picker-styles";
 
 const ACTIVE_INDEX_VAR = "GreetingInspectorActiveIndex";
 const UPCOMING_INDEX_VAR = "GreetingInspectorUpcomingIndex";
+const ACTIVE_SELECTION_VAR = "GreetingInspectorActiveSelection";
+const UPCOMING_SELECTION_VAR = "GreetingInspectorUpcomingSelection";
 const LAST_ADVANCED_EVENT_VAR = "GreetingInspectorLastAdvancedEvent";
 const LAST_ADVANCED_SIGNATURE_VAR = "GreetingInspectorLastAdvancedSignature";
 const ACTIVE_STATUS_VAR = "GreetingInspectorActive";
@@ -16,6 +18,7 @@ const CONTENT_VAR = "GreetingInspectorContent";
 const AUTO_INJECT_VAR = "GreetingInspectorAutoInject";
 const ENABLED_VAR = "GreetingInspectorEnabled";
 const DEBUG_VAR = "GreetingInspectorDebug";
+const GROUP_CHARACTER_STATE_VAR = "GreetingInspectorGroupCharacterState";
 
 const OLD_ACTIVE_INDEX_VAR = "greetingInspector.activeIndex";
 const OLD_UPCOMING_INDEX_VAR = "greetingInspector.upcomingIndex";
@@ -185,6 +188,121 @@ function normalizeUpcomingIndex(value, activeIndex, greetings) {
   }
 
   return index;
+}
+
+function selectionPayload(characterId, index) {
+  const id = asText(characterId);
+  const parsedIndex = parseIndex(index);
+
+  if (!id || parsedIndex === null) {
+    return null;
+  }
+
+  return {
+    characterId: id,
+    index: parsedIndex,
+  };
+}
+
+function selectionFromGreeting(greeting) {
+  return greeting ? selectionPayload(greeting.characterId, greeting.index) : null;
+}
+
+function selectionKey(selection) {
+  const normalized = selectionPayload(
+    selection && selection.characterId,
+    selection && selection.index,
+  );
+
+  return normalized ? `${normalized.characterId}::${normalized.index}` : "";
+}
+
+function sameSelection(left, right) {
+  const leftKey = selectionKey(left);
+  return Boolean(leftKey) && leftKey === selectionKey(right);
+}
+
+function parseSelectionValue(value) {
+  if (value && typeof value === "object") {
+    return selectionPayload(value.characterId, value.index);
+  }
+
+  const text = asText(value);
+  if (!text) {
+    return null;
+  }
+
+  const separator = text.lastIndexOf("::");
+  if (separator > 0) {
+    return selectionPayload(
+      text.slice(0, separator),
+      text.slice(separator + 2),
+    );
+  }
+
+  return null;
+}
+
+function normalizeStoredSelection(value, context) {
+  const selection = parseSelectionValue(value);
+  if (!selection) {
+    return null;
+  }
+
+  return context.greetingByKey[selectionKey(selection)] ?
+      selection
+    : null;
+}
+
+function normalizeUpcomingSelection(value, activeSelection, context) {
+  const selection = normalizeStoredSelection(value, context);
+  if (!selection || sameSelection(selection, activeSelection)) {
+    return null;
+  }
+
+  if (!context.isGroupChat) {
+    if (selection.characterId !== activeSelection.characterId) {
+      return null;
+    }
+
+    if (selection.index <= activeSelection.index) {
+      return null;
+    }
+  }
+
+  return selection;
+}
+
+function defaultUpcomingSelection(activeSelection, context) {
+  const active = selectionPayload(
+    activeSelection && activeSelection.characterId,
+    activeSelection && activeSelection.index,
+  );
+
+  if (!active) {
+    return null;
+  }
+
+  const greetings = context.greetingsByCharacter[active.characterId] || [];
+  const nextGreeting = greetings.find((greeting) => greeting.index > active.index);
+  return selectionFromGreeting(nextGreeting);
+}
+
+function getGreetingBySelection(context, selection) {
+  return context.greetingByKey[selectionKey(selection)] || null;
+}
+
+function selectedCharacterState(context, selection) {
+  const normalized = selectionPayload(
+    selection && selection.characterId,
+    selection && selection.index,
+  );
+
+  return normalized ? context.characterById[normalized.characterId] || null : null;
+}
+
+function greetingOptionValue(greeting) {
+  return `${greeting.characterId}::${greeting.index}`;
 }
 
 function getEventName() {
@@ -459,6 +577,145 @@ async function retryOnMacroRace(operation, label) {
   }
 
   return undefined;
+}
+
+function pushCharacterRef(refs, id, character = null) {
+  const characterId = asText(id) || asText(character && character.id);
+  if (!characterId) {
+    return;
+  }
+
+  if (refs.some((ref) => ref.id === characterId)) {
+    return;
+  }
+
+  refs.push({ id: characterId, character });
+}
+
+function pushCharacterRefValue(refs, value) {
+  if (!value) {
+    return;
+  }
+
+  if (typeof value === "string") {
+    pushCharacterRef(refs, value);
+    return;
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      pushCharacterRefValue(refs, item);
+    }
+    return;
+  }
+
+  if (typeof value !== "object") {
+    return;
+  }
+
+  if (value.character && typeof value.character === "object") {
+    pushCharacterRef(
+      refs,
+      value.characterId || value.character_id || value.character.id,
+      value.character,
+    );
+    return;
+  }
+
+  pushCharacterRef(
+    refs,
+    value.characterId || value.character_id || value.id,
+    value.firstMessage || value.alternateGreetings ? value : null,
+  );
+}
+
+function collectChatCharacterRefs(chat) {
+  const refs = [];
+  if (!chat || typeof chat !== "object") {
+    return refs;
+  }
+
+  pushCharacterRef(refs, chat.characterId, chat.character || null);
+  pushCharacterRefValue(refs, chat.character);
+
+  for (const key of [
+    "characterIds",
+    "character_ids",
+    "characters",
+    "groupCharacters",
+    "group_members",
+    "groupMembers",
+    "members",
+    "participants",
+  ]) {
+    pushCharacterRefValue(refs, chat[key]);
+  }
+
+  for (const groupKey of ["group", "groupChat", "metadata"]) {
+    const group = chat[groupKey];
+    if (!group || typeof group !== "object") {
+      continue;
+    }
+
+    for (const key of [
+      "characterIds",
+      "character_ids",
+      "characters",
+      "members",
+      "participants",
+    ]) {
+      pushCharacterRefValue(refs, group[key]);
+    }
+  }
+
+  return refs;
+}
+
+async function resolveCharacterRef(ref) {
+  if (!ref || !ref.id) {
+    return null;
+  }
+
+  if (ref.character && typeof ref.character === "object") {
+    return {
+      ...ref.character,
+      id: asText(ref.character.id) || ref.id,
+    };
+  }
+
+  try {
+    return await api.characters.get(ref.id);
+  } catch (error) {
+    logDebug("character load failed", {
+      characterId: ref.id,
+      error: error.message || String(error),
+    });
+    return null;
+  }
+}
+
+async function loadChatCharacters(chat) {
+  const refs = collectChatCharacterRefs(chat);
+  const characters = [];
+
+  for (const ref of refs) {
+    const character = await resolveCharacterRef(ref);
+    if (!character) {
+      continue;
+    }
+
+    const characterId = asText(character.id) || ref.id;
+    if (!characterId || characters.some((item) => item.id === characterId)) {
+      continue;
+    }
+
+    characters.push({
+      ...character,
+      id: characterId,
+    });
+  }
+
+  return characters;
 }
 
 async function getActiveChat() {
@@ -806,7 +1063,180 @@ async function resetUpcomingIndex(activeIndex, greetings) {
   return fallbackIndex;
 }
 
-async function readAutoInject(persist = true) {
+function characterScope(characterId, groupScoped) {
+  return {
+    characterId: asText(characterId),
+    groupScoped: Boolean(groupScoped),
+  };
+}
+
+async function readGroupCharacterState() {
+  const value = await readChatVariable(GROUP_CHARACTER_STATE_VAR, {});
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
+async function writeGroupCharacterState(characterId, patch, options = {}) {
+  const id = asText(characterId);
+  if (!id) {
+    return false;
+  }
+
+  const state = await readGroupCharacterState();
+  const current =
+    state[id] && typeof state[id] === "object" && !Array.isArray(state[id]) ?
+      state[id]
+    : {};
+
+  state[id] = {
+    ...current,
+    ...patch,
+  };
+
+  return writeChatVariable(GROUP_CHARACTER_STATE_VAR, state, {
+    required: Boolean(options.required),
+  });
+}
+
+async function readScopedCharacterValue(scope, key, fallback, persist, normalize) {
+  if (!scope || !scope.groupScoped) {
+    const hasStoredValue = await hasVariable(api.variables.character, key);
+    const stored = await getVariable(api.variables.character, key, fallback);
+    const value = normalize(stored, hasStoredValue);
+
+    if (persist && (!hasStoredValue || stored !== value)) {
+      await setVariable(api.variables.character, key, value);
+    }
+
+    return value;
+  }
+
+  const state = await readGroupCharacterState();
+  const current = state[scope.characterId] || {};
+  const hasStoredValue = Object.prototype.hasOwnProperty.call(current, key);
+  const stored = hasStoredValue ? current[key] : fallback;
+  const value = normalize(stored, hasStoredValue);
+
+  if (persist && (!hasStoredValue || stored !== value)) {
+    await writeGroupCharacterState(scope.characterId, { [key]: value });
+  }
+
+  return value;
+}
+
+async function writeScopedCharacterValue(scope, key, value, options = {}) {
+  const required = Boolean(options.required);
+
+  if (!scope || !scope.groupScoped) {
+    const wrote = await setVariable(api.variables.character, key, value);
+    if (required) {
+      requireVariableWrite(wrote, key);
+    }
+
+    const storedExists = await hasVariable(api.variables.character, key);
+    const stored = await getVariable(api.variables.character, key, null);
+    return { storedExists, stored };
+  }
+
+  const wrote = await writeGroupCharacterState(
+    scope.characterId,
+    { [key]: value },
+    { required },
+  );
+  if (required) {
+    requireVariableWrite(wrote, key);
+  }
+
+  const state = await readGroupCharacterState();
+  const current = state[scope.characterId] || {};
+  return {
+    storedExists: Object.prototype.hasOwnProperty.call(current, key),
+    stored: current[key],
+  };
+}
+
+async function readAutoInject(scope, persist = true) {
+  const enabled = await readScopedCharacterValue(
+    scope,
+    AUTO_INJECT_VAR,
+    false,
+    persist,
+    (stored) => asBoolean(stored),
+  );
+
+  logDebug("auto prompt read", {
+    enabled,
+    characterId: scope && scope.characterId,
+    groupScoped: scope && scope.groupScoped,
+  });
+  return enabled;
+}
+
+async function writeAutoInject(scope, enabled) {
+  const normalizedValue = Boolean(enabled);
+  const result = await writeScopedCharacterValue(
+    scope,
+    AUTO_INJECT_VAR,
+    normalizedValue,
+    { required: true },
+  );
+
+  if (!result.storedExists || asBoolean(result.stored) !== normalizedValue) {
+    throw new Error(`Could not confirm ${AUTO_INJECT_VAR}; refresh before trying again.`);
+  }
+
+  return normalizedValue;
+}
+
+async function readInspectorEnabled(scope, persist = true) {
+  const enabled = await readScopedCharacterValue(
+    scope,
+    ENABLED_VAR,
+    true,
+    persist,
+    (stored, hasStoredValue) => hasStoredValue ? asBoolean(stored) : true,
+  );
+
+  logDebug("inspector enabled read", {
+    enabled,
+    characterId: scope && scope.characterId,
+    groupScoped: scope && scope.groupScoped,
+  });
+  return enabled;
+}
+
+async function writeInspectorEnabled(scope, enabled) {
+  const normalizedValue = Boolean(enabled);
+  const result = await writeScopedCharacterValue(
+    scope,
+    ENABLED_VAR,
+    normalizedValue,
+    { required: true },
+  );
+
+  if (!result.storedExists || asBoolean(result.stored) !== normalizedValue) {
+    throw new Error(`Could not confirm ${ENABLED_VAR}; refresh before trying again.`);
+  }
+
+  return normalizedValue;
+}
+
+async function writeInspectorActive(scope, active) {
+  await writeScopedCharacterValue(scope, ACTIVE_STATUS_VAR, Boolean(active));
+}
+
+async function writeInspectorContent(scope, content) {
+  await writeScopedCharacterValue(
+    scope,
+    CONTENT_VAR,
+    typeof content === "string" ? content : "",
+  );
+}
+
+/*
+ * Legacy helpers kept for migration context. Group-aware state uses the
+ * selection helpers below instead of bare per-chat indices.
+ */
+async function readAutoInjectLegacy(persist = true) {
   const hasStoredValue = await hasVariable(api.variables.character, AUTO_INJECT_VAR);
   const stored = await getVariable(api.variables.character, AUTO_INJECT_VAR, false);
   const enabled = asBoolean(stored);
@@ -819,7 +1249,7 @@ async function readAutoInject(persist = true) {
   return enabled;
 }
 
-async function writeAutoInject(enabled) {
+async function writeAutoInjectLegacy(enabled) {
   const normalizedValue = Boolean(enabled);
   const wrote = await setVariable(api.variables.character, AUTO_INJECT_VAR, normalizedValue);
   requireVariableWrite(wrote, AUTO_INJECT_VAR);
@@ -833,7 +1263,7 @@ async function writeAutoInject(enabled) {
   return normalizedValue;
 }
 
-async function readInspectorEnabled(persist = true) {
+async function readInspectorEnabledLegacy(persist = true) {
   const hasStoredValue = await hasVariable(api.variables.character, ENABLED_VAR);
   const stored = await getVariable(api.variables.character, ENABLED_VAR, true);
   const enabled = hasStoredValue ? asBoolean(stored) : true;
@@ -846,7 +1276,7 @@ async function readInspectorEnabled(persist = true) {
   return enabled;
 }
 
-async function writeInspectorEnabled(enabled) {
+async function writeInspectorEnabledLegacy(enabled) {
   const normalizedValue = Boolean(enabled);
   const wrote = await setVariable(api.variables.character, ENABLED_VAR, normalizedValue);
   requireVariableWrite(wrote, ENABLED_VAR);
@@ -860,11 +1290,11 @@ async function writeInspectorEnabled(enabled) {
   return normalizedValue;
 }
 
-async function writeInspectorActive(active) {
+async function writeInspectorActiveLegacy(active) {
   await setVariable(api.variables.character, ACTIVE_STATUS_VAR, Boolean(active));
 }
 
-async function writeInspectorContent(content) {
+async function writeInspectorContentLegacy(content) {
   await setVariable(
     api.variables.character,
     CONTENT_VAR,
@@ -877,13 +1307,235 @@ function buildCharacterGreetings(character) {
     Array.isArray(character.alternateGreetings) ? character.alternateGreetings : [];
 
   return [
-    { index: 0, label: greetingLabel(0), text: asText(character.firstMessage) },
+    {
+      characterId: asText(character.id),
+      characterName: asText(character.name) || "(unnamed)",
+      character,
+      index: 0,
+      label: greetingLabel(0),
+      text: asText(character.firstMessage),
+    },
     ...alternateGreetings.map((text, index) => ({
+      characterId: asText(character.id),
+      characterName: asText(character.name) || "(unnamed)",
+      character,
       index: index + 1,
       label: greetingLabel(index + 1),
       text: asText(text),
     })),
   ];
+}
+
+function buildGreetingContext(activeChat, characters) {
+  const characterStates = [];
+  const characterById = {};
+  const greetingsByCharacter = {};
+  const greetingByKey = {};
+  const allGreetings = [];
+  const activeChatCharacterId = asText(activeChat && activeChat.characterId);
+
+  for (const character of characters) {
+    const characterId = asText(character && character.id);
+    if (!characterId || characterById[characterId]) {
+      continue;
+    }
+
+    const greetings = buildCharacterGreetings(character);
+    const state = {
+      id: characterId,
+      character,
+      greetings,
+    };
+
+    characterStates.push(state);
+    characterById[characterId] = state;
+    greetingsByCharacter[characterId] = greetings;
+
+    for (const greeting of greetings) {
+      greetingByKey[selectionKey(greeting)] = greeting;
+      allGreetings.push(greeting);
+    }
+  }
+
+  const hasGroupShape =
+    characterStates.length > 1 ||
+    Boolean(
+      activeChat &&
+      (
+        Array.isArray(activeChat.characterIds) ||
+        Array.isArray(activeChat.character_ids) ||
+        Array.isArray(activeChat.characters) ||
+        Array.isArray(activeChat.groupMembers) ||
+        Array.isArray(activeChat.group_members) ||
+        Array.isArray(activeChat.members) ||
+        Array.isArray(activeChat.participants) ||
+        activeChat.group ||
+        activeChat.groupChat
+      )
+    );
+
+  return {
+    chat: activeChat,
+    characters,
+    characterStates,
+    characterById,
+    greetingsByCharacter,
+    greetingByKey,
+    allGreetings,
+    activeChatCharacterId,
+    isGroupChat: hasGroupShape,
+  };
+}
+
+function defaultActiveSelection(context) {
+  const preferredCharacterId =
+    context.activeChatCharacterId && context.characterById[context.activeChatCharacterId] ?
+      context.activeChatCharacterId
+    : context.characterStates[0] && context.characterStates[0].id;
+  const greetings = context.greetingsByCharacter[preferredCharacterId] || [];
+
+  return selectionFromGreeting(greetings[0]);
+}
+
+async function readActiveSelection(context, persist = true) {
+  const hasStoredSelection = await hasVariable(api.variables.chat, ACTIVE_SELECTION_VAR);
+  const stored = await readChatVariable(ACTIVE_SELECTION_VAR, null);
+  let activeSelection = normalizeStoredSelection(stored, context);
+
+  if (!activeSelection) {
+    const fallbackSelection = defaultActiveSelection(context);
+    const fallbackIndex = fallbackSelection ? fallbackSelection.index : 0;
+    const legacyIndex =
+      persist ?
+        await readChatVariable(ACTIVE_INDEX_VAR, fallbackIndex)
+      : await getVariable(api.variables.chat, ACTIVE_INDEX_VAR, fallbackIndex);
+
+    activeSelection = normalizeStoredSelection(
+      {
+        characterId: fallbackSelection && fallbackSelection.characterId,
+        index: legacyIndex,
+      },
+      context,
+    ) || fallbackSelection;
+  }
+
+  if (persist && activeSelection && (!hasStoredSelection || selectionKey(stored) !== selectionKey(activeSelection))) {
+    await writeChatVariable(ACTIVE_SELECTION_VAR, activeSelection);
+  }
+
+  logDebug("active selection read", {
+    stored: debugPreview(stored, 80),
+    active: selectionKey(activeSelection),
+  });
+  return activeSelection;
+}
+
+async function writeActiveSelection(activeSelection, context, options = {}) {
+  const normalized = normalizeStoredSelection(activeSelection, context);
+  if (!normalized) {
+    throw new Error(`Could not resolve ${ACTIVE_SELECTION_VAR}; refresh before trying again.`);
+  }
+
+  const confirm = options.confirm !== false;
+  await writeChatVariable(ACTIVE_SELECTION_VAR, normalized, {
+    required: true,
+    skipLegacyCleanup: Boolean(options.skipLegacyCleanup),
+  });
+
+  if (!confirm) {
+    return normalized;
+  }
+
+  const confirmed = await confirmChatVariable(
+    ACTIVE_SELECTION_VAR,
+    selectionKey(normalized),
+    (value) => selectionKey(normalizeStoredSelection(value, context)),
+  );
+
+  if (!confirmed) {
+    throw new Error(`Could not confirm ${ACTIVE_SELECTION_VAR}; refresh before trying again.`);
+  }
+
+  return normalized;
+}
+
+async function readUpcomingSelection(activeSelection, context, persist = true) {
+  const hasStoredSelection = await hasVariable(api.variables.chat, UPCOMING_SELECTION_VAR);
+  const fallbackSelection = defaultUpcomingSelection(activeSelection, context);
+  const stored = await readChatVariable(UPCOMING_SELECTION_VAR, fallbackSelection);
+  let upcomingSelection = normalizeUpcomingSelection(stored, activeSelection, context);
+
+  if (!upcomingSelection) {
+    const fallbackIndex = fallbackSelection ? fallbackSelection.index : null;
+    const legacyIndex =
+      persist ?
+        await readChatVariable(UPCOMING_INDEX_VAR, fallbackIndex)
+      : await getVariable(api.variables.chat, UPCOMING_INDEX_VAR, fallbackIndex);
+
+    upcomingSelection = normalizeUpcomingSelection(
+      {
+        characterId: activeSelection && activeSelection.characterId,
+        index: legacyIndex,
+      },
+      activeSelection,
+      context,
+    ) || fallbackSelection;
+  }
+
+  if (persist && upcomingSelection && (!hasStoredSelection || selectionKey(stored) !== selectionKey(upcomingSelection))) {
+    logDebug("upcoming selection derived without write", {
+      stored: debugPreview(stored, 80),
+      upcoming: selectionKey(upcomingSelection),
+      fallback: selectionKey(fallbackSelection),
+    });
+  }
+
+  logDebug("upcoming selection read", {
+    stored: debugPreview(stored, 80),
+    upcoming: upcomingSelection ? selectionKey(upcomingSelection) : "none",
+    fallback: fallbackSelection ? selectionKey(fallbackSelection) : "none",
+  });
+  return upcomingSelection;
+}
+
+async function writeUpcomingSelection(upcomingSelection, activeSelection, context) {
+  const normalized = normalizeUpcomingSelection(upcomingSelection, activeSelection, context);
+
+  if (!normalized) {
+    const fallbackSelection = defaultUpcomingSelection(activeSelection, context);
+
+    if (!fallbackSelection) {
+      await deleteChatVariable(UPCOMING_SELECTION_VAR, { required: true });
+      return null;
+    }
+
+    return writeUpcomingSelection(fallbackSelection, activeSelection, context);
+  }
+
+  await writeChatVariable(UPCOMING_SELECTION_VAR, normalized, { required: true });
+
+  const confirmed = await confirmChatVariable(
+    UPCOMING_SELECTION_VAR,
+    selectionKey(normalized),
+    (value) => selectionKey(normalizeUpcomingSelection(value, activeSelection, context)),
+  );
+
+  if (!confirmed) {
+    throw new Error(`Could not confirm ${UPCOMING_SELECTION_VAR}; refresh before trying again.`);
+  }
+
+  return normalized;
+}
+
+async function resetUpcomingSelection(activeSelection, context) {
+  const fallbackSelection = defaultUpcomingSelection(activeSelection, context);
+
+  if (!fallbackSelection) {
+    await deleteChatVariable(UPCOMING_SELECTION_VAR, { required: true });
+    return null;
+  }
+
+  return writeUpcomingSelection(fallbackSelection, activeSelection, context);
 }
 
 function inactiveState(reason, detail = "", extraState = {}) {
@@ -899,6 +1551,7 @@ function inactiveState(reason, detail = "", extraState = {}) {
 
 async function loadState(options = {}) {
   const expectedChatId = asText(options.expectedChatId);
+  const persistDerivedState = options.persistDerivedState !== false;
   const activeChat = await waitForActiveChat(expectedChatId);
 
   if (!activeChat) {
@@ -919,28 +1572,50 @@ async function loadState(options = {}) {
     };
   }
 
-  if (!activeChat.characterId) {
-    logDebug("state unavailable", { reason: "chat has no character", chatId: activeChat.id });
-    return inactiveState("The active chat does not have an associated character.");
-  }
+  const characters = await loadChatCharacters(activeChat);
+  const context = buildGreetingContext(activeChat, characters);
 
-  let character = null;
-  try {
-    character = await api.characters.get(activeChat.characterId);
-  } catch (error) {
-    logDebug("character load failed", {
-      characterId: activeChat.characterId,
-      error: error.message || String(error),
+  if (!context.characterStates.length) {
+    logDebug("state unavailable", {
+      reason: "chat has no characters",
+      chatId: activeChat.id,
+      keys: Object.keys(activeChat).join(","),
     });
-  }
-
-  if (!character) {
-    return inactiveState("Could not load the active chat character.");
+    return inactiveState("The active chat does not have any associated characters.");
   }
 
   await runMaintenance();
 
-  const inspectorEnabled = await readInspectorEnabled();
+  if (context.allGreetings.length < 2) {
+    logDebug("state unavailable", {
+      reason: "not enough greetings",
+      chatId: activeChat.id,
+      characterCount: context.characterStates.length,
+      greetingCount: context.allGreetings.length,
+    });
+    return inactiveState(
+      "This chat has no alternate greeting to use as the next scene.",
+      context.characterStates.map((item) => item.character.name || "(unnamed)").join(", "),
+      {
+        chat: activeChat,
+        characters,
+        context,
+        isGroupChat: context.isGroupChat,
+      },
+    );
+  }
+
+  const activeSelection = await readActiveSelection(context, persistDerivedState);
+  const activeGreeting = getGreetingBySelection(context, activeSelection);
+  const activeCharacterState = selectedCharacterState(context, activeSelection);
+  const character = activeCharacterState && activeCharacterState.character;
+
+  if (!activeGreeting || !character) {
+    return inactiveState("Could not resolve the selected greeting character.");
+  }
+
+  const scope = characterScope(character.id, context.isGroupChat);
+  const inspectorEnabled = await readInspectorEnabled(scope, persistDerivedState);
   if (!inspectorEnabled) {
     logDebug("state unavailable", {
       reason: "inspector disabled",
@@ -953,41 +1628,41 @@ async function loadState(options = {}) {
       {
         chat: activeChat,
         character,
+        characters,
+        context,
+        activeSelection,
+        activeGreeting,
+        scope,
+        isGroupChat: context.isGroupChat,
         inspectorEnabled,
       },
     );
   }
 
-  const greetings = buildCharacterGreetings(character);
-
-  if (greetings.length < 2) {
-    logDebug("state unavailable", {
-      reason: "not enough greetings",
-      characterId: character.id,
-      greetingCount: greetings.length,
-    });
-    return inactiveState(
-      "This character has no alternate greeting to use as the next scene.",
-      character.name || "",
-      {
-        chat: activeChat,
-        character,
-        inspectorEnabled,
-      },
-    );
-  }
-
-  const activeIndex = await readActiveIndex(greetings);
-  const upcomingIndex = await readUpcomingIndex(activeIndex, greetings);
-  const autoInject = await readAutoInject();
+  const upcomingSelection = await readUpcomingSelection(
+    activeSelection,
+    context,
+    persistDerivedState,
+  );
+  const upcomingGreeting = getGreetingBySelection(context, upcomingSelection);
+  const autoInject = await readAutoInject(scope, persistDerivedState);
 
   const state = {
     ready: true,
     chat: activeChat,
     character,
-    greetings,
-    activeIndex,
-    upcomingIndex,
+    characters,
+    context,
+    scope,
+    isGroupChat: context.isGroupChat,
+    greetings: activeCharacterState.greetings,
+    allGreetings: context.allGreetings,
+    activeSelection,
+    upcomingSelection,
+    activeGreeting,
+    upcomingGreeting,
+    activeIndex: activeSelection.index,
+    upcomingIndex: upcomingSelection ? upcomingSelection.index : null,
     autoInject,
     inspectorEnabled,
     busyAction: getBusyAction(),
@@ -996,10 +1671,12 @@ async function loadState(options = {}) {
 
   logDebug("state loaded", {
     chatId: activeChat.id,
-    characterId: activeChat.characterId,
+    characterId: character.id,
     character: character.name || "",
-    activeIndex,
-    upcomingIndex: upcomingIndex === null ? "none" : upcomingIndex,
+    group: context.isGroupChat,
+    characterCount: context.characterStates.length,
+    active: selectionKey(activeSelection),
+    upcoming: upcomingSelection ? selectionKey(upcomingSelection) : "none",
     autoInject,
   });
 
@@ -1021,11 +1698,14 @@ async function removeInjectedNote() {
   }
 }
 
-function buildAuthorNote(prewrittenScene) {
+function buildAuthorNote(prewrittenScene, greeting = null) {
   const prewrittenSceneExcerpt = prewrittenScene.slice(
     0,
     PREWRITTEN_SCENE_PROMPT_CHAR_LIMIT,
   );
+  const targetSpeaker = greeting && greeting.characterName ?
+    `\nTARGET SPEAKER:\nThe upcoming prewritten scene belongs to ${greeting.characterName}. In a group chat, preserve that speaker identity for the eventual inserted greeting.\n`
+    : "";
 
   return `<shape_scene_direction>
 
@@ -1034,6 +1714,7 @@ An upcoming prewritten scene exists. Treat it as a private long-term destination
 Over many turns, slowly and naturally guide the current narrative toward the exact conditions where that prewritten scene could begin immediately afterward.
 The goal is not to find a convenient fade-out. The goal is to narrate at a slow, natural pace as if these instructions didnt exist. Slowly and naturally moving towards the next scene.
 It should take numerous turns to arrive, so you must wait until the narrative has naturally arrived as close as possible to the first moment of the upcoming prewritten scene WITHOUT using any part of the scene in your reply.
+${targetSpeaker}
 
 USER OVERRIDE:
 If the user's latest reply contains ${USER_OVERRIDE_MARKER}, immediately make a best-effort attempt to reach the handoff threshold.
@@ -1077,34 +1758,33 @@ ${prewrittenSceneExcerpt}
 
 async function syncNextSceneContext(state) {
   if (!state.ready) {
-    await writeInspectorActive(false);
-    await writeInspectorContent("");
+    await writeInspectorActive(state.scope, false);
+    await writeInspectorContent(state.scope, "");
     await removeInjectedNote();
     return { hasContent: false, injected: false, error: "" };
   }
 
-  const nextGreeting =
-    state.upcomingIndex === null ? null : state.greetings[state.upcomingIndex];
+  const nextGreeting = state.upcomingGreeting;
 
   if (!nextGreeting || !nextGreeting.text) {
-    await writeInspectorActive(true);
-    await writeInspectorContent("");
+    await writeInspectorActive(state.scope, true);
+    await writeInspectorContent(state.scope, "");
     await removeInjectedNote();
     logDebug("prompt context cleared", {
       reason: "no upcoming content",
-      upcomingIndex: state.upcomingIndex === null ? "none" : state.upcomingIndex,
+      upcoming: state.upcomingSelection ? selectionKey(state.upcomingSelection) : "none",
     });
     return { hasContent: false, injected: false, error: "" };
   }
 
-  const content = buildAuthorNote(nextGreeting.text);
-  await writeInspectorActive(true);
-  await writeInspectorContent(content);
+  const content = buildAuthorNote(nextGreeting.text, nextGreeting);
+  await writeInspectorActive(state.scope, true);
+  await writeInspectorContent(state.scope, content);
 
   if (!state.autoInject) {
     await removeInjectedNote();
     logDebug("prompt context saved without injection", {
-      upcomingIndex: state.upcomingIndex,
+      upcoming: selectionKey(state.upcomingSelection),
       length: content.length,
     });
     return { hasContent: true, injected: false, error: "" };
@@ -1119,7 +1799,7 @@ async function syncNextSceneContext(state) {
       ephemeral: true,
     });
     logDebug("prompt injection synced", {
-      upcomingIndex: state.upcomingIndex,
+      upcoming: selectionKey(state.upcomingSelection),
       length: content.length,
     });
     return { hasContent: true, injected: true, error: "" };
@@ -1484,8 +2164,35 @@ function powerButtonHtml(state, busyAction) {
   return `<button class="ls-gi-button ls-gi-power-button ${className}" id="ls-gi-power-toggle" data-action="powerToggle" type="button" title="${title}"${disabled}><span>${label}</span></button>`;
 }
 
-function indexLabel(greeting) {
-  return greeting ? `${greeting.index} (${greeting.label})` : "none";
+function indexLabel(greeting, includeCharacter = false) {
+  if (!greeting) {
+    return "none";
+  }
+
+  const label = `${greeting.index} (${greeting.label})`;
+  return includeCharacter ? `${greeting.characterName}: ${label}` : label;
+}
+
+function activeGreetingLabel(state) {
+  return indexLabel(state.activeGreeting, state.isGroupChat);
+}
+
+function upcomingGreetingLabel(state) {
+  return indexLabel(state.upcomingGreeting, state.isGroupChat);
+}
+
+function upcomingPickerOptions(state) {
+  if (!state.ready) {
+    return [];
+  }
+
+  if (!state.isGroupChat) {
+    return state.greetings.filter((greeting) => greeting.index > state.activeIndex);
+  }
+
+  return state.allGreetings.filter(
+    (greeting) => !sameSelection(greeting, state.activeSelection),
+  );
 }
 
 function buildDrawerHtml(state) {
@@ -1517,9 +2224,9 @@ function buildDrawerHtml(state) {
 </div>`;
   }
 
-  const activeGreeting = state.greetings[state.activeIndex];
-  const upcomingGreeting =
-    state.upcomingIndex === null ? null : state.greetings[state.upcomingIndex];
+  const activeGreeting = state.activeGreeting;
+  const upcomingGreeting = state.upcomingGreeting;
+  const canPickUpcoming = upcomingPickerOptions(state).length > 0;
   const promptMessage = promptContentMessage(state.sync);
 
   return `
@@ -1529,13 +2236,13 @@ function buildDrawerHtml(state) {
     <div class="ls-gi-status-top">
       <div>
         <div class="ls-gi-kicker">Active greeting</div>
-        <div class="ls-gi-value">${escapeHtml(indexLabel(activeGreeting))}</div>
-        <div class="ls-gi-meta">Next: ${escapeHtml(indexLabel(upcomingGreeting))}</div>
+        <div class="ls-gi-value">${escapeHtml(activeGreetingLabel(state))}</div>
+        <div class="ls-gi-meta">Next: ${escapeHtml(upcomingGreetingLabel(state))}</div>
       </div>
       <div class="ls-gi-button-row">
         ${refreshButtonHtml("ls-gi-drawer-refresh", busyAction)}
         <button class="ls-gi-button ls-gi-button-secondary" id="ls-gi-active" data-action="active" type="button"${busyAction ? " disabled" : ""}><span>Active</span></button>
-        <button class="ls-gi-button" id="ls-gi-next" data-action="upcoming" type="button"${busyAction || !upcomingGreeting ? " disabled" : ""}><span>Next</span></button>
+        <button class="ls-gi-button" id="ls-gi-next" data-action="upcoming" type="button"${busyAction || !canPickUpcoming ? " disabled" : ""}><span>Next</span></button>
         <button class="ls-gi-button ls-gi-button-danger" id="ls-gi-force" data-action="force" type="button"${busyAction || !upcomingGreeting ? " disabled" : ""}><span>Force</span></button>
       </div>
     </div>
@@ -1551,14 +2258,14 @@ function buildDrawerHtml(state) {
     <section class="ls-gi-preview">
       <div class="ls-gi-preview-header">
         <span class="ls-gi-preview-title">Active</span>
-        <span class="ls-gi-meta">${escapeHtml(indexLabel(activeGreeting))}</span>
+        <span class="ls-gi-meta">${escapeHtml(activeGreetingLabel(state))}</span>
       </div>
       <pre class="ls-gi-preview-text">${escapeHtml(displayGreeting(activeGreeting && activeGreeting.text))}</pre>
     </section>
     <section class="ls-gi-preview">
       <div class="ls-gi-preview-header">
         <span class="ls-gi-preview-title">Next</span>
-        <span class="ls-gi-meta">${escapeHtml(indexLabel(upcomingGreeting))}</span>
+        <span class="ls-gi-meta">${escapeHtml(upcomingGreetingLabel(state))}</span>
       </div>
       <pre class="ls-gi-preview-text">${escapeHtml(upcomingGreeting ? displayGreeting(upcomingGreeting.text) : "(no upcoming greeting)")}</pre>
     </section>
@@ -1801,44 +2508,52 @@ async function renderUi(state) {
   await renderFloatingRefresh();
 }
 
-function buildGreetingOptions(greetings, selectedIndex, minIndex = 0) {
+function pickerOptions(kind, state) {
+  return kind === "active" ? state.allGreetings : upcomingPickerOptions(state);
+}
+
+function buildGreetingOptions(greetings, selectedSelection, includeCharacter) {
+  const selectedKey = selectionKey(selectedSelection);
   return greetings
-    .filter((greeting) => greeting.index >= minIndex)
     .map((greeting) => {
-      const selected = greeting.index === selectedIndex ? " selected" : "";
-      return `<option value="${greeting.index}"${selected}>${escapeHtml(indexLabel(greeting))}</option>`;
+      const selected = selectionKey(greeting) === selectedKey ? " selected" : "";
+      return `<option value="${escapeHtml(greetingOptionValue(greeting))}"${selected}>${escapeHtml(indexLabel(greeting, includeCharacter))}</option>`;
     })
     .join("");
 }
 
-function buildPickerHtml(kind, state, selectedIndex) {
+function buildPickerHtml(kind, state, selectedSelection) {
   const isActivePicker = kind === "active";
-  const minIndex = isActivePicker ? 0 : state.activeIndex + 1;
-  const selectedGreeting = state.greetings[selectedIndex];
-  const activeGreeting = state.greetings[state.activeIndex];
+  const options = pickerOptions(kind, state);
+  const selectedGreeting =
+    getGreetingBySelection(state.context, selectedSelection) || options[0] || null;
+  const activeGreeting = state.activeGreeting;
   const selectId = isActivePicker ? "ls-gi-picker-active" : "ls-gi-picker-upcoming";
-  const title = isActivePicker ? "Active greeting index" : "Next greeting index";
+  const title = isActivePicker ? "Active greeting" : "Next greeting";
   const confirmLabel = isActivePicker ? "Use Active Greeting" : "Use Next Greeting";
   const nextAfterActive =
     isActivePicker ?
-      state.greetings[selectedIndex + 1] || null
+      getGreetingBySelection(
+        state.context,
+        defaultUpcomingSelection(selectionFromGreeting(selectedGreeting), state.context),
+      )
     : selectedGreeting;
   const hint =
     isActivePicker ?
-      `Selecting this greeting will reset next to ${indexLabel(nextAfterActive)}.`
-    : `Current active greeting remains ${indexLabel(activeGreeting)}.`;
+      `Selecting this greeting will reset next to ${indexLabel(nextAfterActive, state.isGroupChat)}.`
+    : `Current active greeting remains ${indexLabel(activeGreeting, state.isGroupChat)}.`;
 
   return `
 <div class="ls-gi-picker">
   <div class="ls-gi-picker-main">
-    <div class="ls-gi-meta">Character: ${escapeHtml(state.character.name || "(unnamed)")}</div>
+    <div class="ls-gi-meta">${escapeHtml(state.isGroupChat ? `Group chat: ${state.context.characterStates.length} characters` : `Character: ${state.character.name || "(unnamed)"}`)}</div>
     <div class="ls-gi-picker-field">
       <label class="ls-gi-picker-label" for="${selectId}">${escapeHtml(title)}</label>
       <select class="ls-gi-picker-select" id="${selectId}">
-        ${buildGreetingOptions(state.greetings, selectedIndex, minIndex)}
+        ${buildGreetingOptions(options, selectionFromGreeting(selectedGreeting), state.isGroupChat)}
       </select>
     </div>
-    <div class="ls-gi-meta">Selected: ${escapeHtml(indexLabel(selectedGreeting))}</div>
+    <div class="ls-gi-meta">Selected: ${escapeHtml(indexLabel(selectedGreeting, state.isGroupChat))}</div>
     <div class="ls-gi-meta">${escapeHtml(hint)}</div>
     <div class="ls-gi-picker-preview" aria-label="Selected greeting preview">
       <pre>${escapeHtml(displayGreeting(selectedGreeting && selectedGreeting.text))}</pre>
@@ -1858,10 +2573,9 @@ async function openPicker(kind, state, options = {}) {
   }
 
   const isActivePicker = kind === "active";
-  const minIndex = isActivePicker ? 0 : state.activeIndex + 1;
-  const maxIndex = state.greetings.length - 1;
+  const selectableGreetings = pickerOptions(kind, state);
 
-  if (minIndex > maxIndex) {
+  if (!selectableGreetings.length) {
     api.ui.toast("There is no later greeting to use as the next greeting.", "warning");
     return null;
   }
@@ -1872,23 +2586,23 @@ async function openPicker(kind, state, options = {}) {
     !api.ui.dom ||
     typeof api.ui.dom.addStyle !== "function"
   ) {
-    const fallbackIndex = await openPickerFallback(kind, state);
-    if (fallbackIndex !== null && typeof options.onUse === "function") {
-      await options.onUse(fallbackIndex);
+    const fallbackSelection = await openPickerFallback(kind, state);
+    if (fallbackSelection !== null && typeof options.onUse === "function") {
+      await options.onUse(fallbackSelection);
     }
-    return fallbackIndex;
+    return fallbackSelection;
   }
 
-  let selectedIndex =
+  let selectedSelection =
     isActivePicker ?
-      clampIndex(state.activeIndex, maxIndex)
-    : normalizeUpcomingIndex(state.upcomingIndex, state.activeIndex, state.greetings) ??
-      minIndex;
+      state.activeSelection
+    : normalizeUpcomingSelection(state.upcomingSelection, state.activeSelection, state.context) ??
+      selectionFromGreeting(selectableGreetings[0]);
   let modal = null;
   const unsubscribers = [];
 
   function render() {
-    modal.root.update(buildPickerHtml(kind, state, selectedIndex));
+    modal.root.update(buildPickerHtml(kind, state, selectedSelection));
   }
 
   function cleanup() {
@@ -1910,7 +2624,7 @@ async function openPicker(kind, state, options = {}) {
       persistent: false,
     });
     render();
-    logDebug("picker opened", { kind, selectedIndex });
+    logDebug("picker opened", { kind, selected: selectionKey(selectedSelection) });
   } catch (error) {
     cleanup();
     logDebug("picker open failed", { kind, error: error.message || String(error) });
@@ -1939,7 +2653,7 @@ async function openPicker(kind, state, options = {}) {
 
       logDebug("picker closed", {
         kind,
-        selectedIndex: value === null ? "cancelled" : value,
+        selected: value === null ? "cancelled" : selectionKey(value),
       });
       resolve(value);
     }
@@ -1955,17 +2669,24 @@ async function openPicker(kind, state, options = {}) {
           return;
         }
 
-        const nextIndex =
+        const nextSelection =
           isActivePicker ?
-            clampIndex(event.targetValue, maxIndex)
-          : normalizeUpcomingIndex(event.targetValue, state.activeIndex, state.greetings);
+            normalizeStoredSelection(parseSelectionValue(event.targetValue), state.context)
+          : normalizeUpcomingSelection(
+              parseSelectionValue(event.targetValue),
+              state.activeSelection,
+              state.context,
+            );
 
-        if (nextIndex === null) {
+        if (nextSelection === null) {
           return;
         }
 
-        selectedIndex = nextIndex;
-        logDebug("picker selection changed", { kind, selectedIndex });
+        selectedSelection = nextSelection;
+        logDebug("picker selection changed", {
+          kind,
+          selected: selectionKey(selectedSelection),
+        });
         render();
       }),
     );
@@ -1983,7 +2704,7 @@ async function openPicker(kind, state, options = {}) {
 
           if (action === "use") {
             if (typeof options.onUse !== "function") {
-              finish(selectedIndex);
+              finish(selectedSelection);
               return;
             }
 
@@ -1993,8 +2714,8 @@ async function openPicker(kind, state, options = {}) {
 
             committing = true;
             try {
-              await options.onUse(selectedIndex);
-              finish(selectedIndex);
+              await options.onUse(selectedSelection);
+              finish(selectedSelection);
             } catch (error) {
               const message = error.message || String(error);
               logDebug("picker commit failed", { kind, error: message });
@@ -2010,30 +2731,40 @@ async function openPicker(kind, state, options = {}) {
 
 async function openPickerFallback(kind, state) {
   const isActivePicker = kind === "active";
-  const minIndex = isActivePicker ? 0 : state.activeIndex + 1;
-  const maxIndex = state.greetings.length - 1;
-  let selectedIndex =
-    isActivePicker ?
-      clampIndex(state.activeIndex, maxIndex)
-    : normalizeUpcomingIndex(state.upcomingIndex, state.activeIndex, state.greetings) ??
-      minIndex;
+  const options = pickerOptions(kind, state);
+  let selectedOptionIndex = Math.max(
+    0,
+    options.findIndex((greeting) =>
+      sameSelection(
+        greeting,
+        isActivePicker ? state.activeSelection : state.upcomingSelection,
+      )
+    ),
+  );
 
   while (true) {
-    const greeting = state.greetings[selectedIndex];
+    const greeting = options[selectedOptionIndex];
+    const optionSummary = options
+      .map((item, index) =>
+        `${index + 1}. ${indexLabel(item, state.isGroupChat)}`,
+      )
+      .join("\n");
     const input = await api.ui.prompt(
       [
-        `Character: ${state.character.name || "(unnamed)"}`,
-        `Selected: ${indexLabel(greeting)}`,
+        state.isGroupChat ?
+          `Group chat: ${state.context.characterStates.length} characters`
+        : `Character: ${state.character.name || "(unnamed)"}`,
+        `Selected: ${indexLabel(greeting, state.isGroupChat)}`,
         "",
-        "Leave blank to use this greeting. Enter n, p, or a greeting number to change selection.",
+        "Leave blank to use this greeting. Enter n, p, or an option number to change selection.",
+        "",
+        optionSummary,
         "",
         displayGreeting(greeting.text),
       ].join("\n"),
       "",
       {
-        placeholder:
-          isActivePicker ? `blank=use, n, p, or 0-${maxIndex}`
-          : `blank=use, n, p, or ${minIndex}-${maxIndex}`,
+        placeholder: `blank=use, n, p, or 1-${options.length}`,
         submitLabel: isActivePicker ? "Use active" : "Use next",
         cancelLabel: "Cancel",
       },
@@ -2045,28 +2776,32 @@ async function openPickerFallback(kind, state) {
 
     const command = input.trim().toLowerCase();
     if (!command || command === "s" || command === "select" || command === "use") {
-      return selectedIndex;
+      return selectionFromGreeting(greeting);
     }
 
     if (command === "n" || command === "next") {
-      selectedIndex =
-        selectedIndex >= maxIndex ? minIndex : selectedIndex + 1;
+      selectedOptionIndex =
+        selectedOptionIndex >= options.length - 1 ? 0 : selectedOptionIndex + 1;
       continue;
     }
 
     if (command === "p" || command === "prev" || command === "previous") {
-      selectedIndex =
-        selectedIndex <= minIndex ? maxIndex : selectedIndex - 1;
+      selectedOptionIndex =
+        selectedOptionIndex <= 0 ? options.length - 1 : selectedOptionIndex - 1;
       continue;
     }
 
-    const nextIndex = parseIndex(command);
-    if (nextIndex === null || nextIndex < minIndex || nextIndex > maxIndex) {
-      api.ui.toast(`Choose a number from ${minIndex} to ${maxIndex}.`, "warning");
+    const nextOptionIndex = parseIndex(command);
+    if (
+      nextOptionIndex === null ||
+      nextOptionIndex < 1 ||
+      nextOptionIndex > options.length
+    ) {
+      api.ui.toast(`Choose a number from 1 to ${options.length}.`, "warning");
       continue;
     }
 
-    selectedIndex = nextIndex;
+    selectedOptionIndex = nextOptionIndex - 1;
   }
 }
 
@@ -2181,10 +2916,33 @@ function beginGreetingMessageInsert(greeting) {
     return Promise.resolve(false);
   }
 
+  const baseOptions = { role: "assistant" };
+  const speakerOptions = {
+    ...baseOptions,
+    characterId: greeting.characterId,
+    characterName: greeting.characterName,
+    name: greeting.characterName,
+  };
+
+  async function sendWithFallback() {
+    try {
+      await api.chat.sendMessage(greeting.text, speakerOptions);
+    } catch (error) {
+      logDebug("greeting insert speaker hint failed", {
+        characterId: greeting.characterId,
+        character: greeting.characterName,
+        error: error.message || String(error),
+      });
+      await api.chat.sendMessage(greeting.text, baseOptions);
+    }
+  }
+
   try {
-    return api.chat.sendMessage(greeting.text, { role: "assistant" })
+    return sendWithFallback()
       .then(() => {
         logDebug("greeting inserted", {
+          characterId: greeting.characterId,
+          character: greeting.characterName,
           index: greeting.index,
           length: greeting.text.length,
         });
@@ -2211,115 +2969,152 @@ async function insertGreetingMessage(greeting) {
 }
 
 async function advanceToUpcomingGreeting(state, source = "manual") {
-  const advancedIndex =
-    normalizeUpcomingIndex(state.upcomingIndex, state.activeIndex, state.greetings) ??
-    defaultUpcomingIndex(state.activeIndex, state.greetings);
+  const advancedSelection =
+    normalizeUpcomingSelection(
+      state.upcomingSelection,
+      state.activeSelection,
+      state.context,
+    ) ??
+    defaultUpcomingSelection(state.activeSelection, state.context);
+  const advancedGreeting = getGreetingBySelection(state.context, advancedSelection);
   const automaticTransition = TRANSITION_EVENTS.has(source);
-  const previousActiveIndex = state.activeIndex;
-  const previousUpcomingIndex = state.upcomingIndex;
+  const previousActiveSelection = state.activeSelection;
+  const previousUpcomingSelection = state.upcomingSelection;
 
   logDebug("advance requested", {
     source,
-    activeIndex: state.activeIndex,
-    upcomingIndex: state.upcomingIndex === null ? "none" : state.upcomingIndex,
-    advancedIndex: advancedIndex === null ? "none" : advancedIndex,
+    active: selectionKey(state.activeSelection),
+    upcoming: state.upcomingSelection ? selectionKey(state.upcomingSelection) : "none",
+    advanced: advancedSelection ? selectionKey(advancedSelection) : "none",
   });
 
-  if (advancedIndex === null || advancedIndex === state.activeIndex) {
-    state.upcomingIndex = await resetUpcomingIndex(state.activeIndex, state.greetings);
+  if (!advancedSelection || !advancedGreeting || sameSelection(advancedSelection, state.activeSelection)) {
+    state.upcomingSelection = await resetUpcomingSelection(state.activeSelection, state.context);
+    state.upcomingGreeting = getGreetingBySelection(state.context, state.upcomingSelection);
+    state.upcomingIndex = state.upcomingSelection ? state.upcomingSelection.index : null;
     return {
-      advancedIndex: null,
+      advancedSelection: null,
       insertedGreeting: false,
       insertionFailed: false,
     };
   }
 
   if (automaticTransition) {
-    const insertPromise = beginGreetingMessageInsert(state.greetings[advancedIndex]);
-    const stateWritePromise = writeActiveIndex(advancedIndex, state.greetings, {
+    const insertPromise = beginGreetingMessageInsert(advancedGreeting);
+    const stateWritePromise = writeActiveSelection(advancedSelection, state.context, {
       confirm: false,
       skipLegacyCleanup: true,
     })
-      .then((activeIndex) => ({ activeIndex, error: null }))
-      .catch((error) => ({ activeIndex: null, error }));
+      .then((activeSelection) => ({ activeSelection, error: null }))
+      .catch((error) => ({ activeSelection: null, error }));
 
     const insertedGreeting = await insertPromise;
     const stateWrite = await stateWritePromise;
 
     if (stateWrite.error) {
       logDebug("advance state commit after insert failed", {
-        activeIndex: advancedIndex,
+        active: selectionKey(advancedSelection),
         error: stateWrite.error.message || String(stateWrite.error),
       });
     } else {
-      state.activeIndex = stateWrite.activeIndex;
-      state.upcomingIndex = defaultUpcomingIndex(state.activeIndex, state.greetings);
+      state.activeSelection = stateWrite.activeSelection;
+      state.activeGreeting = getGreetingBySelection(state.context, state.activeSelection);
+      state.character = state.activeGreeting.character;
+      state.scope = characterScope(state.character.id, state.context.isGroupChat);
+      state.greetings =
+        state.context.greetingsByCharacter[state.activeSelection.characterId] || [];
+      state.activeIndex = state.activeSelection.index;
+      state.upcomingSelection = defaultUpcomingSelection(
+        state.activeSelection,
+        state.context,
+      );
+      state.upcomingGreeting = getGreetingBySelection(
+        state.context,
+        state.upcomingSelection,
+      );
+      state.upcomingIndex = state.upcomingSelection ? state.upcomingSelection.index : null;
       logDebug("advance state committed after insert", {
-        activeIndex: state.activeIndex,
-        upcomingIndex: state.upcomingIndex === null ? "none" : state.upcomingIndex,
+        active: selectionKey(state.activeSelection),
+        upcoming: state.upcomingSelection ? selectionKey(state.upcomingSelection) : "none",
       });
     }
 
     if (!insertedGreeting) {
       return {
-        advancedIndex: null,
-        attemptedIndex: advancedIndex,
+        advancedSelection: null,
+        attemptedSelection: advancedSelection,
         insertedGreeting: false,
         insertionFailed: true,
-        persistedAdvancedState: state.activeIndex === advancedIndex,
+        persistedAdvancedState: sameSelection(state.activeSelection, advancedSelection),
         skipPostTransitionRefresh: true,
       };
     }
 
     return {
-      advancedIndex,
-      attemptedIndex: advancedIndex,
+      advancedSelection,
+      attemptedSelection: advancedSelection,
       insertedGreeting,
       insertionFailed: false,
-      persistedAdvancedState: state.activeIndex === advancedIndex,
+      persistedAdvancedState: sameSelection(state.activeSelection, advancedSelection),
       skipPostTransitionRefresh: true,
     };
   }
 
-  state.activeIndex = await writeActiveIndex(advancedIndex, state.greetings);
-  state.upcomingIndex = await resetUpcomingIndex(state.activeIndex, state.greetings);
+  state.activeSelection = await writeActiveSelection(advancedSelection, state.context);
+  state.activeGreeting = getGreetingBySelection(state.context, state.activeSelection);
+  state.character = state.activeGreeting.character;
+  state.scope = characterScope(state.character.id, state.context.isGroupChat);
+  state.greetings =
+    state.context.greetingsByCharacter[state.activeSelection.characterId] || [];
+  state.activeIndex = state.activeSelection.index;
+  state.upcomingSelection = await resetUpcomingSelection(state.activeSelection, state.context);
+  state.upcomingGreeting = getGreetingBySelection(state.context, state.upcomingSelection);
+  state.upcomingIndex = state.upcomingSelection ? state.upcomingSelection.index : null;
 
   logDebug("advance state committed before insert", {
-    activeIndex: state.activeIndex,
-    upcomingIndex: state.upcomingIndex === null ? "none" : state.upcomingIndex,
+    active: selectionKey(state.activeSelection),
+    upcoming: state.upcomingSelection ? selectionKey(state.upcomingSelection) : "none",
   });
 
-  const insertedGreeting = await insertGreetingMessage(state.greetings[advancedIndex]);
+  const insertedGreeting = await insertGreetingMessage(advancedGreeting);
 
   if (!insertedGreeting) {
-    state.activeIndex = await writeActiveIndex(previousActiveIndex, state.greetings);
-    state.upcomingIndex = await writeUpcomingIndex(
-      previousUpcomingIndex,
-      state.activeIndex,
-      state.greetings,
+    state.activeSelection = await writeActiveSelection(previousActiveSelection, state.context);
+    state.activeGreeting = getGreetingBySelection(state.context, state.activeSelection);
+    state.character = state.activeGreeting.character;
+    state.scope = characterScope(state.character.id, state.context.isGroupChat);
+    state.greetings =
+      state.context.greetingsByCharacter[state.activeSelection.characterId] || [];
+    state.activeIndex = state.activeSelection.index;
+    state.upcomingSelection = await writeUpcomingSelection(
+      previousUpcomingSelection,
+      state.activeSelection,
+      state.context,
     );
+    state.upcomingGreeting = getGreetingBySelection(state.context, state.upcomingSelection);
+    state.upcomingIndex = state.upcomingSelection ? state.upcomingSelection.index : null;
 
     logDebug("advance rolled back after insert failure", {
-      activeIndex: state.activeIndex,
-      upcomingIndex: state.upcomingIndex === null ? "none" : state.upcomingIndex,
+      active: selectionKey(state.activeSelection),
+      upcoming: state.upcomingSelection ? selectionKey(state.upcomingSelection) : "none",
     });
 
     return {
-      advancedIndex: null,
-      attemptedIndex: advancedIndex,
+      advancedSelection: null,
+      attemptedSelection: advancedSelection,
       insertedGreeting: false,
       insertionFailed: true,
     };
   }
 
   logDebug("advance committed", {
-    activeIndex: state.activeIndex,
-    upcomingIndex: state.upcomingIndex === null ? "none" : state.upcomingIndex,
+    active: selectionKey(state.activeSelection),
+    upcoming: state.upcomingSelection ? selectionKey(state.upcomingSelection) : "none",
   });
 
   return {
-    advancedIndex,
-    attemptedIndex: advancedIndex,
+    advancedSelection,
+    attemptedSelection: advancedSelection,
     insertedGreeting,
     insertionFailed: false,
   };
@@ -2374,7 +3169,7 @@ async function maybeAdvanceForTransition(state, eventName) {
       rememberRecentTransition(signature, eventKey);
     }
 
-    return { advanced: result.advancedIndex !== null, result };
+    return { advanced: result.advancedSelection !== null, result };
   } finally {
     if (globalThis[TRANSITION_IN_FLIGHT_KEY] === signature) {
       globalThis[TRANSITION_IN_FLIGHT_KEY] = "";
@@ -2383,9 +3178,9 @@ async function maybeAdvanceForTransition(state, eventName) {
 }
 
 function nextGreetingMessage(state) {
-  return state.upcomingIndex === null ?
+  return !state.upcomingGreeting ?
       "No later greeting is available."
-    : `Next greeting is ${state.upcomingIndex} (${state.greetings[state.upcomingIndex].label}).`;
+    : `Next greeting is ${indexLabel(state.upcomingGreeting, state.isGroupChat)}.`;
 }
 
 async function refreshPipeline(options = {}) {
@@ -2405,7 +3200,11 @@ async function refreshPipeline(options = {}) {
     revision,
   });
 
-  let state = await loadState({ expectedChatId, strictChat });
+  let state = await loadState({
+    expectedChatId,
+    strictChat,
+    persistDerivedState: !options.processTransition,
+  });
 
   if (state.staleEvent) {
     return state;
@@ -2435,7 +3234,7 @@ async function refreshPipeline(options = {}) {
   if (transitionResult && transitionResult.result?.skipPostTransitionRefresh) {
     logDebug("refresh pipeline deferred post-transition render", {
       reason,
-      activeIndex: transitionResult.result.advancedIndex,
+      active: selectionKey(transitionResult.result.advancedSelection),
     });
     return state;
   }
@@ -2463,29 +3262,35 @@ async function refreshPipeline(options = {}) {
     const result = transitionResult.result;
 
     if (result.insertionFailed) {
+      const attemptedGreeting =
+        getGreetingBySelection(state.context, result.attemptedSelection) ||
+        getGreetingBySelection(state.context, result.advancedSelection);
       api.ui.toast(
-        `Could not insert greeting ${result.attemptedIndex} (${state.greetings[result.attemptedIndex].label}); active greeting was not advanced.`,
+        `Could not insert greeting ${indexLabel(attemptedGreeting, state.isGroupChat)}; active greeting was not advanced.`,
         "warning",
       );
-    } else if (result.advancedIndex !== null) {
+    } else if (result.advancedSelection !== null) {
+      const advancedGreeting =
+        getGreetingBySelection(state.context, result.advancedSelection) ||
+        state.activeGreeting;
       api.ui.toast(
-        `Greeting transition advanced to ${result.advancedIndex} (${state.greetings[result.advancedIndex].label}). ${nextGreetingMessage(state)}`,
+        `Greeting transition advanced to ${indexLabel(advancedGreeting, state.isGroupChat)}. ${nextGreetingMessage(state)}`,
         "success",
       );
     }
   } else if (toast) {
     const nextLabel =
-      state.upcomingIndex === null ? "none" : String(state.upcomingIndex);
+      state.upcomingGreeting ? indexLabel(state.upcomingGreeting, state.isGroupChat) : "none";
     api.ui.toast(
-      `Greeting Inspector refreshed. Active ${state.activeIndex}; next ${nextLabel}. ${promptContentMessage(state.sync)}`,
+      `Greeting Inspector refreshed. Active ${activeGreetingLabel(state)}; next ${nextLabel}. ${promptContentMessage(state.sync)}`,
       state.sync && state.sync.error ? "warning" : "success",
     );
   }
 
   logDebug("refresh pipeline complete", {
     reason,
-    activeIndex: state.activeIndex,
-    upcomingIndex: state.upcomingIndex === null ? "none" : state.upcomingIndex,
+    active: selectionKey(state.activeSelection),
+    upcoming: state.upcomingSelection ? selectionKey(state.upcomingSelection) : "none",
     autoInject: state.autoInject,
   });
 
@@ -2507,10 +3312,13 @@ async function refreshWithBusy(source) {
   }
 }
 
-async function commitActiveSelection(state, selectedIndex) {
+async function commitActiveSelection(state, selectedSelection) {
   await ensureActiveChatStill(state.chat && state.chat.id, "Active greeting change");
-  const committedActiveIndex = await writeActiveIndex(selectedIndex, state.greetings);
-  await resetUpcomingIndex(committedActiveIndex, state.greetings);
+  const committedActiveSelection = await writeActiveSelection(
+    selectedSelection,
+    state.context,
+  );
+  await resetUpcomingSelection(committedActiveSelection, state.context);
 
   const refreshedState = await refreshPipeline({ reason: "active picker committed" });
   if (!refreshedState.ready) {
@@ -2519,17 +3327,17 @@ async function commitActiveSelection(state, selectedIndex) {
   }
 
   api.ui.toast(
-    `Active greeting set to ${refreshedState.activeIndex} (${refreshedState.greetings[refreshedState.activeIndex].label}). ${nextGreetingMessage(refreshedState)} ${promptContentMessage(refreshedState.sync)}`,
+    `Active greeting set to ${activeGreetingLabel(refreshedState)}. ${nextGreetingMessage(refreshedState)} ${promptContentMessage(refreshedState.sync)}`,
     refreshedState.sync && refreshedState.sync.error ? "warning" : "success",
   );
 }
 
-async function commitUpcomingSelection(state, selectedIndex) {
+async function commitUpcomingSelection(state, selectedSelection) {
   await ensureActiveChatStill(state.chat && state.chat.id, "Next greeting change");
-  await writeUpcomingIndex(
-    selectedIndex,
-    state.activeIndex,
-    state.greetings,
+  await writeUpcomingSelection(
+    selectedSelection,
+    state.activeSelection,
+    state.context,
   );
 
   const refreshedState = await refreshPipeline({ reason: "next picker committed" });
@@ -2538,13 +3346,13 @@ async function commitUpcomingSelection(state, selectedIndex) {
     return;
   }
 
-  if (refreshedState.upcomingIndex === null) {
+  if (!refreshedState.upcomingGreeting) {
     api.ui.toast("There is no later greeting to use as the next greeting.", "warning");
     return;
   }
 
   api.ui.toast(
-    `Next greeting set to ${refreshedState.upcomingIndex} (${refreshedState.greetings[refreshedState.upcomingIndex].label}). ${promptContentMessage(refreshedState.sync)}`,
+    `Next greeting set to ${upcomingGreetingLabel(refreshedState)}. ${promptContentMessage(refreshedState.sync)}`,
     refreshedState.sync && refreshedState.sync.error ? "warning" : "success",
   );
 }
@@ -2557,7 +3365,7 @@ async function handleActivePicker() {
   }
 
   await openPicker("active", state, {
-    onUse: (selectedIndex) => commitActiveSelection(state, selectedIndex),
+    onUse: (selectedSelection) => commitActiveSelection(state, selectedSelection),
   });
 }
 
@@ -2569,7 +3377,7 @@ async function handleUpcomingPicker() {
   }
 
   await openPicker("upcoming", state, {
-    onUse: (selectedIndex) => commitUpcomingSelection(state, selectedIndex),
+    onUse: (selectedSelection) => commitUpcomingSelection(state, selectedSelection),
   });
 }
 
@@ -2585,14 +3393,17 @@ async function handleForceAdvance() {
   const refreshedState = await refreshPipeline({ reason: "force complete" });
 
   if (result.insertionFailed) {
+    const attemptedGreeting =
+      getGreetingBySelection(state.context, result.attemptedSelection) ||
+      getGreetingBySelection(state.context, result.advancedSelection);
     api.ui.toast(
-      `Could not insert greeting ${result.attemptedIndex} (${state.greetings[result.attemptedIndex].label}); active greeting was not advanced.`,
+      `Could not insert greeting ${indexLabel(attemptedGreeting, state.isGroupChat)}; active greeting was not advanced.`,
       "warning",
     );
     return;
   }
 
-  if (result.advancedIndex === null) {
+  if (result.advancedSelection === null) {
     api.ui.toast("There is no later greeting to force.", "warning");
     return;
   }
@@ -2603,7 +3414,7 @@ async function handleForceAdvance() {
   }
 
   api.ui.toast(
-    `Forced greeting transition to ${result.advancedIndex} (${refreshedState.greetings[result.advancedIndex].label}). ${nextGreetingMessage(refreshedState)} ${promptContentMessage(refreshedState.sync)}`,
+    `Forced greeting transition to ${activeGreetingLabel(refreshedState)}. ${nextGreetingMessage(refreshedState)} ${promptContentMessage(refreshedState.sync)}`,
     refreshedState.sync && refreshedState.sync.error ? "warning" : "success",
   );
 }
@@ -2615,7 +3426,7 @@ async function handleAutoPromptChange(checked) {
     return;
   }
 
-  await writeAutoInject(checked);
+  await writeAutoInject(state.scope, checked);
   const refreshedState = await refreshPipeline({ reason: "auto prompt committed" });
 
   if (!refreshedState.ready) {
@@ -2641,7 +3452,7 @@ async function handlePowerToggle() {
 
   setBusyAction("powerToggle");
   try {
-    await writeInspectorEnabled(nextEnabled);
+    await writeInspectorEnabled(state.scope, nextEnabled);
     logDebug("inspector enabled toggled", {
       enabled: nextEnabled,
       character: characterName,
@@ -2711,8 +3522,8 @@ async function teardown() {
   unsubscribeByKey(DRAWER_CHANGE_UNSUB_KEY);
   unsubscribeByKey(FLOATING_CLICK_UNSUB_KEY);
   await removeInjectedNote();
-  await writeInspectorActive(false);
-  await writeInspectorContent("");
+  await writeInspectorActive(null, false);
+  await writeInspectorContent(null, "");
 
   try {
     if (api.ui && api.ui.dom && typeof api.ui.dom.cleanup === "function") {
