@@ -1,5 +1,5 @@
 // @ls:reload-on-edit
-const VERSION = "2026-06-16-group-chat";
+const VERSION = "2026-06-16-group-chat-loop-fix";
 
 const INJECTION_ID = "greeting-inspector-next-scene-note";
 const DRAWER_TAB_ID = "greeting-inspector-status";
@@ -1075,6 +1075,27 @@ async function readGroupCharacterState() {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
 }
 
+function valuesEqual(left, right) {
+  if (left === right) {
+    return true;
+  }
+
+  if (
+    left &&
+    right &&
+    typeof left === "object" &&
+    typeof right === "object"
+  ) {
+    try {
+      return JSON.stringify(left) === JSON.stringify(right);
+    } catch {
+      return false;
+    }
+  }
+
+  return false;
+}
+
 async function writeGroupCharacterState(characterId, patch, options = {}) {
   const id = asText(characterId);
   if (!id) {
@@ -1086,6 +1107,13 @@ async function writeGroupCharacterState(characterId, patch, options = {}) {
     state[id] && typeof state[id] === "object" && !Array.isArray(state[id]) ?
       state[id]
     : {};
+
+  const unchanged = Object.entries(patch)
+    .every(([key, value]) => valuesEqual(current[key], value));
+
+  if (unchanged) {
+    return true;
+  }
 
   state[id] = {
     ...current,
@@ -1115,10 +1143,6 @@ async function readScopedCharacterValue(scope, key, fallback, persist, normalize
   const hasStoredValue = Object.prototype.hasOwnProperty.call(current, key);
   const stored = hasStoredValue ? current[key] : fallback;
   const value = normalize(stored, hasStoredValue);
-
-  if (persist && (!hasStoredValue || stored !== value)) {
-    await writeGroupCharacterState(scope.characterId, { [key]: value });
-  }
 
   return value;
 }
