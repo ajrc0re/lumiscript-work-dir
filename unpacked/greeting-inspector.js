@@ -1,5 +1,5 @@
 // @ls:reload-on-edit
-const VERSION = "2026-06-16-group-chat-loop-fix";
+const VERSION = "2026-06-17-remove-target-speaker-prompt";
 
 const INJECTION_ID = "greeting-inspector-next-scene-note";
 const DRAWER_TAB_ID = "greeting-inspector-status";
@@ -16,6 +16,7 @@ const LAST_ADVANCED_SIGNATURE_VAR = "GreetingInspectorLastAdvancedSignature";
 const ACTIVE_STATUS_VAR = "GreetingInspectorActive";
 const CONTENT_VAR = "GreetingInspectorContent";
 const AUTO_INJECT_VAR = "GreetingInspectorAutoInject";
+const AUTO_INJECT_POSITION_VAR = "GreetingInspectorAutoInjectPosition";
 const ENABLED_VAR = "GreetingInspectorEnabled";
 const DEBUG_VAR = "GreetingInspectorDebug";
 const GROUP_CHARACTER_STATE_VAR = "GreetingInspectorGroupCharacterState";
@@ -59,6 +60,8 @@ const LATEST_MESSAGE_RETRY_DELAY_MS = 150;
 const MACRO_RACE_RETRY_ATTEMPTS = 5;
 const MACRO_RACE_INITIAL_DELAY_MS = 15;
 const DRAG_CLICK_DISTANCE_PX = 6;
+const AUTO_INJECT_MIN_POSITION = 0;
+const AUTO_INJECT_MAX_POSITION = 9999;
 
 const CONTEXT_REFRESH_EVENTS = new Set([
   "ls:startup",
@@ -166,6 +169,18 @@ function asBoolean(value) {
   }
 
   return asText(value).toLowerCase() === "true";
+}
+
+function normalizeAutoInjectPosition(value) {
+  const position = parseIndex(value);
+  if (position === null) {
+    return AUTO_INJECT_MIN_POSITION;
+  }
+
+  return Math.max(
+    AUTO_INJECT_MIN_POSITION,
+    Math.min(position, AUTO_INJECT_MAX_POSITION),
+  );
 }
 
 function greetingLabel(index) {
@@ -1211,6 +1226,42 @@ async function writeAutoInject(scope, enabled) {
   return normalizedValue;
 }
 
+async function readAutoInjectPosition(scope, persist = true) {
+  const position = await readScopedCharacterValue(
+    scope,
+    AUTO_INJECT_POSITION_VAR,
+    AUTO_INJECT_MIN_POSITION,
+    persist,
+    (stored) => normalizeAutoInjectPosition(stored),
+  );
+
+  logDebug("auto prompt position read", {
+    position,
+    characterId: scope && scope.characterId,
+    groupScoped: scope && scope.groupScoped,
+  });
+  return position;
+}
+
+async function writeAutoInjectPosition(scope, position) {
+  const normalizedValue = normalizeAutoInjectPosition(position);
+  const result = await writeScopedCharacterValue(
+    scope,
+    AUTO_INJECT_POSITION_VAR,
+    normalizedValue,
+    { required: true },
+  );
+
+  if (
+    !result.storedExists ||
+    normalizeAutoInjectPosition(result.stored) !== normalizedValue
+  ) {
+    throw new Error(`Could not confirm ${AUTO_INJECT_POSITION_VAR}; refresh before trying again.`);
+  }
+
+  return normalizedValue;
+}
+
 async function readInspectorEnabled(scope, persist = true) {
   const enabled = await readScopedCharacterValue(
     scope,
@@ -1245,12 +1296,12 @@ async function writeInspectorEnabled(scope, enabled) {
 }
 
 async function writeInspectorActive(scope, active) {
-  await writeScopedCharacterValue(scope, ACTIVE_STATUS_VAR, Boolean(active));
+  await setVariable(api.variables.character, ACTIVE_STATUS_VAR, Boolean(active));
 }
 
 async function writeInspectorContent(scope, content) {
-  await writeScopedCharacterValue(
-    scope,
+  await setVariable(
+    api.variables.character,
     CONTENT_VAR,
     typeof content === "string" ? content : "",
   );
@@ -1670,6 +1721,10 @@ async function loadState(options = {}) {
   );
   const upcomingGreeting = getGreetingBySelection(context, upcomingSelection);
   const autoInject = await readAutoInject(scope, persistDerivedState);
+  const autoInjectPosition = await readAutoInjectPosition(
+    scope,
+    persistDerivedState,
+  );
 
   const state = {
     ready: true,
@@ -1688,6 +1743,7 @@ async function loadState(options = {}) {
     activeIndex: activeSelection.index,
     upcomingIndex: upcomingSelection ? upcomingSelection.index : null,
     autoInject,
+    autoInjectPosition,
     inspectorEnabled,
     busyAction: getBusyAction(),
     sync: null,
@@ -1702,6 +1758,7 @@ async function loadState(options = {}) {
     active: selectionKey(activeSelection),
     upcoming: upcomingSelection ? selectionKey(upcomingSelection) : "none",
     autoInject,
+    autoInjectPosition,
   });
 
   return state;
@@ -1722,14 +1779,11 @@ async function removeInjectedNote() {
   }
 }
 
-function buildAuthorNote(prewrittenScene, greeting = null) {
+function buildAuthorNote(prewrittenScene) {
   const prewrittenSceneExcerpt = prewrittenScene.slice(
     0,
     PREWRITTEN_SCENE_PROMPT_CHAR_LIMIT,
   );
-  const targetSpeaker = greeting && greeting.characterName ?
-    `\nTARGET SPEAKER:\nThe upcoming prewritten scene belongs to ${greeting.characterName}. In a group chat, preserve that speaker identity for the eventual inserted greeting.\n`
-    : "";
 
   return `<shape_scene_direction>
 
@@ -1738,7 +1792,6 @@ An upcoming prewritten scene exists. Treat it as a private long-term destination
 Over many turns, slowly and naturally guide the current narrative toward the exact conditions where that prewritten scene could begin immediately afterward.
 The goal is not to find a convenient fade-out. The goal is to narrate at a slow, natural pace as if these instructions didnt exist. Slowly and naturally moving towards the next scene.
 It should take numerous turns to arrive, so you must wait until the narrative has naturally arrived as close as possible to the first moment of the upcoming prewritten scene WITHOUT using any part of the scene in your reply.
-${targetSpeaker}
 
 USER OVERRIDE:
 If the user's latest reply contains ${USER_OVERRIDE_MARKER}, immediately make a best-effort attempt to reach the handoff threshold.
@@ -1782,18 +1835,18 @@ ${prewrittenSceneExcerpt}
 
 async function syncNextSceneContext(state) {
   if (!state.ready) {
+    await removeInjectedNote();
     await writeInspectorActive(state.scope, false);
     await writeInspectorContent(state.scope, "");
-    await removeInjectedNote();
     return { hasContent: false, injected: false, error: "" };
   }
 
   const nextGreeting = state.upcomingGreeting;
 
   if (!nextGreeting || !nextGreeting.text) {
+    await removeInjectedNote();
     await writeInspectorActive(state.scope, true);
     await writeInspectorContent(state.scope, "");
-    await removeInjectedNote();
     logDebug("prompt context cleared", {
       reason: "no upcoming content",
       upcoming: state.upcomingSelection ? selectionKey(state.upcomingSelection) : "none",
@@ -1801,12 +1854,12 @@ async function syncNextSceneContext(state) {
     return { hasContent: false, injected: false, error: "" };
   }
 
-  const content = buildAuthorNote(nextGreeting.text, nextGreeting);
-  await writeInspectorActive(state.scope, true);
-  await writeInspectorContent(state.scope, content);
+  const content = buildAuthorNote(nextGreeting.text);
 
   if (!state.autoInject) {
     await removeInjectedNote();
+    await writeInspectorActive(state.scope, true);
+    await writeInspectorContent(state.scope, content);
     logDebug("prompt context saved without injection", {
       upcoming: selectionKey(state.upcomingSelection),
       length: content.length,
@@ -1814,24 +1867,50 @@ async function syncNextSceneContext(state) {
     return { hasContent: true, injected: false, error: "" };
   }
 
+  let injected = false;
+  let injectionError = "";
+  const injectionPosition = normalizeAutoInjectPosition(state.autoInjectPosition);
+
   try {
-    await removeInjectedNote();
     await api.chat.inject(INJECTION_ID, content, {
       mode: "intercept",
-      role: "user",
-      depth: 0,
+      role: "system",
+      depth: injectionPosition,
       ephemeral: true,
     });
+    injected = true;
+  } catch (error) {
+    injectionError = error.message || String(error);
+  }
+
+  await writeInspectorActive(state.scope, true);
+  await writeInspectorContent(state.scope, content);
+
+  if (injected) {
     logDebug("prompt injection synced", {
       upcoming: selectionKey(state.upcomingSelection),
+      characterId: nextGreeting.characterId,
+      character: nextGreeting.characterName,
+      greetingIndex: nextGreeting.index,
+      contentHash: hashString(nextGreeting.text),
+      position: injectionPosition,
+      depth: injectionPosition,
       length: content.length,
     });
     return { hasContent: true, injected: true, error: "" };
-  } catch (error) {
-    const message = error.message || String(error);
-    logDebug("prompt injection failed", { error: message });
-    return { hasContent: true, injected: false, error: message };
   }
+
+  logDebug("prompt injection failed", {
+    upcoming: selectionKey(state.upcomingSelection),
+    characterId: nextGreeting.characterId,
+    character: nextGreeting.characterName,
+    greetingIndex: nextGreeting.index,
+    contentHash: hashString(nextGreeting.text),
+    position: injectionPosition,
+    depth: injectionPosition,
+    error: injectionError,
+  });
+  return { hasContent: true, injected: false, error: injectionError };
 }
 
 function promptContentMessage(syncResult) {
@@ -2013,6 +2092,27 @@ function buildStyles() {
   width: 14px;
   height: 14px;
   accent-color: var(--lumiverse-accent, #3b82f6);
+}
+
+.ls-gi-inline-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--lumiverse-text-muted, rgba(245, 245, 245, 0.72));
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.ls-gi-inline-input {
+  min-height: 28px;
+  width: 72px;
+  color: var(--lumiverse-text, #f5f5f5);
+  background: var(--lumiverse-input-bg, rgba(255, 255, 255, 0.08));
+  border: 1px solid var(--lumiverse-border, rgba(255, 255, 255, 0.18));
+  border-radius: 6px;
+  padding: 4px 8px;
+  font: inherit;
+  font-size: 12px;
 }
 
 .ls-gi-preview-grid {
@@ -2275,6 +2375,10 @@ function buildDrawerHtml(state) {
         <input class="ls-gi-checkbox" id="ls-gi-auto-prompt" type="checkbox"${state.autoInject ? " checked" : ""}${busyAction ? " disabled" : ""}>
         <span>Auto prompt</span>
       </label>
+      <label class="ls-gi-inline-label" for="ls-gi-auto-position">
+        <span>Within</span>
+        <input class="ls-gi-inline-input" id="ls-gi-auto-position" type="number" min="${AUTO_INJECT_MIN_POSITION}" max="${AUTO_INJECT_MAX_POSITION}" step="1" inputmode="numeric" value="${escapeHtml(normalizeAutoInjectPosition(state.autoInjectPosition))}" title="Auto prompt within position"${busyAction ? " disabled" : ""}>
+      </label>
       <div class="ls-gi-message">${escapeHtml(promptMessage)}</div>
     </div>
   </div>
@@ -2400,14 +2504,20 @@ async function attachDrawerHandlers(root) {
   );
 
   globalThis[DRAWER_CHANGE_UNSUB_KEY] = root.on("change", async (event) => {
-    if (event.targetId !== "ls-gi-auto-prompt") {
+    if (event.targetId === "ls-gi-auto-prompt") {
+      await handleUiAction("autoPrompt", {
+        source: "drawer",
+        checked: Boolean(event.targetChecked),
+      });
       return;
     }
 
-    await handleUiAction("autoPrompt", {
-      source: "drawer",
-      checked: Boolean(event.targetChecked),
-    });
+    if (event.targetId === "ls-gi-auto-position") {
+      await handleUiAction("autoPosition", {
+        source: "drawer",
+        position: event.targetValue,
+      });
+    }
   });
 }
 
@@ -2941,33 +3051,15 @@ function beginGreetingMessageInsert(greeting) {
   }
 
   const baseOptions = { role: "assistant" };
-  const speakerOptions = {
-    ...baseOptions,
-    characterId: greeting.characterId,
-    characterName: greeting.characterName,
-    name: greeting.characterName,
-  };
-
-  async function sendWithFallback() {
-    try {
-      await api.chat.sendMessage(greeting.text, speakerOptions);
-    } catch (error) {
-      logDebug("greeting insert speaker hint failed", {
-        characterId: greeting.characterId,
-        character: greeting.characterName,
-        error: error.message || String(error),
-      });
-      await api.chat.sendMessage(greeting.text, baseOptions);
-    }
-  }
 
   try {
-    return sendWithFallback()
+    return api.chat.sendMessage(greeting.text, baseOptions)
       .then(() => {
         logDebug("greeting inserted", {
           characterId: greeting.characterId,
           character: greeting.characterName,
           index: greeting.index,
+          contentHash: hashString(greeting.text),
           length: greeting.text.length,
         });
         return true;
@@ -3464,6 +3556,27 @@ async function handleAutoPromptChange(checked) {
   );
 }
 
+async function handleAutoPositionChange(position) {
+  const state = await refreshPipeline({ reason: "auto position prepare" });
+  if (!state.ready) {
+    api.ui.toast(state.reason || "Greeting Inspector is inactive.", "warning");
+    return;
+  }
+
+  await writeAutoInjectPosition(state.scope, position);
+  const refreshedState = await refreshPipeline({ reason: "auto position committed" });
+
+  if (!refreshedState.ready) {
+    api.ui.toast(refreshedState.reason || "Greeting Inspector is inactive.", "warning");
+    return;
+  }
+
+  api.ui.toast(
+    `Auto prompt within position ${normalizeAutoInjectPosition(refreshedState.autoInjectPosition)}. ${promptContentMessage(refreshedState.sync)}`,
+    refreshedState.sync && refreshedState.sync.error ? "warning" : "success",
+  );
+}
+
 async function handlePowerToggle() {
   const state = await loadState();
   if (!state.character) {
@@ -3526,6 +3639,11 @@ async function handleUiAction(action, options = {}) {
 
     if (action === "autoPrompt") {
       await handleAutoPromptChange(Boolean(options.checked));
+      return;
+    }
+
+    if (action === "autoPosition") {
+      await handleAutoPositionChange(options.position);
       return;
     }
 
