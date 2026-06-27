@@ -1,5 +1,5 @@
 // @ls:reload-on-edit
-const VERSION = "2026-06-17-remove-target-speaker-prompt";
+const VERSION = "2026-06-26-stronger-prompt";
 
 const INJECTION_ID = "greeting-inspector-next-scene-note";
 const DRAWER_TAB_ID = "greeting-inspector-status";
@@ -34,8 +34,14 @@ const OLD_CHAT_VARIABLE_KEYS = {
   [LAST_ADVANCED_SIGNATURE_VAR]: OLD_LAST_ADVANCED_SIGNATURE_VAR,
 };
 
-const PREWRITTEN_SCENE_HANDOFF_MARKER = "--T--";
-const USER_OVERRIDE_MARKER = "--O--";
+const HANDOFF_TAG_NAME = "scene-handoff";
+const USER_OVERRIDE_TAG_NAME = "scene-handoff-now";
+const HANDOFF_TAG = `<${HANDOFF_TAG_NAME} />`;
+const USER_OVERRIDE_TAG = `<${USER_OVERRIDE_TAG_NAME} />`;
+const HANDOFF_EXTRA_KEY = "greetingInspectorSceneHandoff";
+const HANDOFF_CONTENT_PROCESSOR_ID = "greeting-inspector-scene-handoff-tags";
+const HANDOFF_TAG_PATTERN =
+  /<\s*scene-handoff\b(?:[^>"']|"[^"]*"|'[^']*')*\/\s*>|<\s*scene-handoff\b(?:[^>"']|"[^"]*"|'[^']*')*>([\s\S]*?)<\s*\/\s*scene-handoff\s*>/gi;
 
 const DRAWER_TAB_KEY = "__greetingInspectorDrawerTabV3";
 const DRAWER_CLICK_UNSUB_KEY = "__greetingInspectorDrawerClickUnsubV3";
@@ -44,6 +50,8 @@ const FLOATING_HANDLE_KEY = "__greetingInspectorFloatingHandleV3";
 const FLOATING_CLICK_UNSUB_KEY = "__greetingInspectorFloatingClickUnsubV3";
 const FLOATING_POINTER_UNSUB_KEY = "__greetingInspectorFloatingPointerUnsubV3";
 const FLOATING_POINTER_START_KEY = "__greetingInspectorFloatingPointerStartV3";
+const HANDOFF_PROCESSOR_HANDLE_KEY = "__greetingInspectorHandoffProcessorHandleV4";
+const PENDING_HANDOFFS_KEY = "__greetingInspectorPendingHandoffsV4";
 const BUSY_ACTION_KEY = "__greetingInspectorBusyActionV3";
 const TRANSITION_IN_FLIGHT_KEY = "__greetingInspectorTransitionInFlightV3";
 const DEBUG_LOG_KEY = "__greetingInspectorDebugLogV3";
@@ -82,7 +90,6 @@ const TRANSITION_EVENTS = new Set([
   "MESSAGE_SWIPED",
   "SWIPE_EDITED",
   "CHARACTER_MESSAGE_RENDERED",
-  "USER_MESSAGE_RENDERED",
 ]);
 
 function asText(value) {
@@ -428,33 +435,199 @@ function transitionSourceIdFromEvent() {
     asText(data && data.generationId);
 }
 
-function normalizeMarkerContent(content) {
+function normalizeHandoffContent(content) {
   return String(content ?? "")
     .replace(/[\u200B-\u200D\u2060]/g, "")
     .replace(/\r\n?/g, "\n");
 }
 
-function analyzeSceneMarker(content) {
-  const normalized = normalizeMarkerContent(content);
-  const trimmedRight = normalized.replace(/[ \t\n\f\v\u00A0]+$/g, "");
+function hasHandoffExtra(extra) {
+  return Boolean(extra && typeof extra === "object" && extra[HANDOFF_EXTRA_KEY]);
+}
 
-  if (!trimmedRight) {
-    return { hasMarker: false, finalLine: "", lineCount: 0, length: 0 };
-  }
+function stripHandoffTags(content) {
+  const normalized = normalizeHandoffContent(content);
+  let tagCount = 0;
 
-  const lines = trimmedRight.split("\n");
-  const finalLine = lines[lines.length - 1].trim();
+  HANDOFF_TAG_PATTERN.lastIndex = 0;
+  const stripped = normalized.replace(HANDOFF_TAG_PATTERN, () => {
+    tagCount++;
+    return "";
+  });
 
   return {
-    hasMarker: finalLine === PREWRITTEN_SCENE_HANDOFF_MARKER,
-    finalLine,
-    lineCount: lines.length,
+    tagCount,
+    content: stripped
+      .replace(/[ \t]+\n/g, "\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .replace(/[ \t]{2,}/g, " ")
+      .trimEnd(),
+  };
+}
+
+function analyzeSceneHandoff(content, extra) {
+  const normalized = normalizeHandoffContent(content);
+  const stripped = stripHandoffTags(normalized);
+  const extraHandoff = hasHandoffExtra(extra);
+
+  return {
+    hasHandoff: stripped.tagCount > 0 || extraHandoff,
+    tagCount: stripped.tagCount,
+    extraHandoff,
+    content: stripped.content,
     length: normalized.length,
   };
 }
 
-function hasSceneChanged(content) {
-  return analyzeSceneMarker(content).hasMarker;
+function hasSceneChanged(content, extra) {
+  return analyzeSceneHandoff(content, extra).hasHandoff;
+}
+
+function handoffExtraPayload(ctx, handoff) {
+  return {
+    at: Date.now(),
+    origin: asText(ctx && ctx.origin),
+    tagCount: handoff.tagCount,
+    contentHash: hashString(handoff.content),
+  };
+}
+
+function pendingHandoffs() {
+  const pending = Array.isArray(globalThis[PENDING_HANDOFFS_KEY]) ?
+    globalThis[PENDING_HANDOFFS_KEY]
+  : [];
+  globalThis[PENDING_HANDOFFS_KEY] = pending;
+  return pending;
+}
+
+function rememberPendingHandoff(ctx, handoff) {
+  const sourceId = asText(ctx && ctx.messageId);
+  const content = String(handoff.content ?? "");
+  const contentHash = hashString(handoff.content);
+
+  if (!sourceId && !content) {
+    return;
+  }
+
+  const pending = pendingHandoffs();
+  pending.push({
+    chatId: asText(ctx && ctx.chatId),
+    sourceId,
+    content,
+    contentHash,
+    tagCount: handoff.tagCount,
+    origin: asText(ctx && ctx.origin),
+    at: Date.now(),
+  });
+
+  while (pending.length > 24) {
+    pending.shift();
+  }
+}
+
+function takePendingHandoff(chatId, sourceId, content = "") {
+  const pending = pendingHandoffs();
+  const normalizedChatId = asText(chatId);
+  const normalizedSourceId = asText(sourceId);
+  const contentText = String(content ?? "");
+  const contentHash = hashString(contentText);
+
+  if (!normalizedSourceId && !contentText) {
+    return null;
+  }
+
+  const index = pending.findIndex((entry) =>
+    entry &&
+    (!normalizedChatId || !entry.chatId || entry.chatId === normalizedChatId) &&
+    (
+      (normalizedSourceId && entry.sourceId === normalizedSourceId) ||
+      (!entry.sourceId && entry.contentHash === contentHash)
+    )
+  );
+
+  if (index < 0) {
+    return null;
+  }
+
+  const [entry] = pending.splice(index, 1);
+  return entry;
+}
+
+function handleHandoffContent(ctx) {
+  const handoff = analyzeSceneHandoff(ctx && ctx.content, ctx && ctx.extra);
+  if (!handoff.hasHandoff || handoff.tagCount <= 0) {
+    return undefined;
+  }
+
+  if (ctx.origin !== "render") {
+    rememberPendingHandoff(ctx, handoff);
+  }
+
+  logDebug("handoff tag captured", {
+    origin: ctx && ctx.origin,
+    messageId: ctx && ctx.messageId,
+    tags: handoff.tagCount,
+    length: handoff.length,
+  });
+
+  const patch = {};
+  if (handoff.content !== String((ctx && ctx.content) ?? "")) {
+    patch.content = handoff.content;
+  }
+
+  if (
+    ctx.origin !== "render" &&
+    ctx.origin !== "swipe_add" &&
+    ctx.origin !== "swipe_update"
+  ) {
+    patch.extra = {
+      [HANDOFF_EXTRA_KEY]: handoffExtraPayload(ctx, handoff),
+    };
+  }
+
+  return Object.keys(patch).length ? patch : undefined;
+}
+
+async function registerHandoffContentProcessor() {
+  if (
+    !api.chat ||
+    typeof api.chat.registerContentProcessor !== "function"
+  ) {
+    logDebug("handoff content processor unavailable");
+    return;
+  }
+
+  try {
+    const handle = await api.chat.registerContentProcessor(handleHandoffContent, {
+      id: HANDOFF_CONTENT_PROCESSOR_ID,
+      origin: ["create", "update", "swipe_add", "swipe_update", "render"],
+      priority: 10,
+      timeoutMs: 2000,
+    });
+    globalThis[HANDOFF_PROCESSOR_HANDLE_KEY] = handle;
+    logDebug("handoff content processor registered", {
+      id: handle && handle.id ? handle.id : HANDOFF_CONTENT_PROCESSOR_ID,
+    });
+  } catch (error) {
+    logDebug("handoff content processor registration failed", {
+      error: error.message || String(error),
+    });
+  }
+}
+
+function unregisterHandoffContentProcessor() {
+  const handle = globalThis[HANDOFF_PROCESSOR_HANDLE_KEY];
+  globalThis[HANDOFF_PROCESSOR_HANDLE_KEY] = null;
+
+  if (!handle || typeof handle.remove !== "function") {
+    return;
+  }
+
+  try {
+    handle.remove();
+  } catch {
+    // Processor teardown is best-effort.
+  }
 }
 
 function hashString(value) {
@@ -1786,47 +1959,14 @@ function buildAuthorNote(prewrittenScene) {
   );
 
   return `<shape_scene_direction>
-
-DIRECTION TARGET:
-An upcoming prewritten scene exists. Treat it as a private long-term destination for story direction, staging, character positioning, emotional setup, and momentum.
-Over many turns, slowly and naturally guide the current narrative toward the exact conditions where that prewritten scene could begin immediately afterward.
-The goal is not to find a convenient fade-out. The goal is to narrate at a slow, natural pace as if these instructions didnt exist. Slowly and naturally moving towards the next scene.
-It should take numerous turns to arrive, so you must wait until the narrative has naturally arrived as close as possible to the first moment of the upcoming prewritten scene WITHOUT using any part of the scene in your reply.
-
-USER OVERRIDE:
-If the user's latest reply contains ${USER_OVERRIDE_MARKER}, immediately make a best-effort attempt to reach the handoff threshold.
-
-PACING AND HANDOFF SPEED:
-Do not transition too fast. It should take numerous turns to arrive at the next scene in most cases.
-Treat the upcoming prewritten scene as a long-term destination to earn through present-moment movement, not a marker to use at the first plausible pause.
-Prefer gradual movement toward the doorway of the upcoming prewritten scene over immediate marker use.
-Use the marker only when the current scene is already at the doorstep of the upcoming prewritten scene, or when the user's latest reply contains the user override marker: \`${USER_OVERRIDE_MARKER}\`.
-
-UPCOMING PREWRITTEN SCENE PRIVACY:
-Use the upcoming prewritten scene only as a target for deciding how to steer the current scene.
-MANDATORY: Do not quote, summarize, paraphrase, adapt, preview, blend, or reuse any part of it. Do not use its URLs, images, formatting, headings, or exact details. DO NOT use it for anything other than a reference on what direction to guide the current scene. NEVER include ANY PORTION of the upcoming greeting in your response; it will be injected automatically when you send the marker.
-
-MARKER OUTPUT REQUIREMENT:
-If and only if the handoff threshold has been reached, send the prewritten scene handoff marker as the end of your response. Write the final non-whitespace line as exactly:
-
-${PREWRITTEN_SCENE_HANDOFF_MARKER}
-
-After the marker, stop immediately.
-Any objects, trackers, hidden blocks, notes, or any other required text must come BEFORE the marker if necessary.
-The marker must be the absolute final line and overrides all other formatting instructions.
-
-LATE HANDOFF POLICY:
-Default to continuing the current narrative at a natural pace, NEVER try to 'bridge the gap' or arrive at the doorstep of the next scene unnaturally.
-Move steadily toward the upcoming prewritten scene over the course of several turns, keep writing the present moment until that prewritten scene is nearly ready to start.
-The handoff should usually happen at the latest viable point, often right before the prewritten scene would begin or at the instant it is about to begin.
-Do not hand off just because there is a calm moment, a completed emotional beat, a quiet pause, or a place where a normal scene ending would make sense.
-Do not use the marker as a fade to black, summary transition, curtain drop, chapter break, or convenient stopping point.
-
-VALID HANDOFF THRESHOLD:
-Only hand off when the current scene has advanced to the doorstep of the upcoming prewritten scene.
-The next assistant message after the marker should be able to start the prewritten scene without needing extra setup, bridging, explanation, or repositioning.
-If another reply could still naturally move closer to the upcoming prewritten scene without contradicting the conversation, keep going instead of using the marker.
-When uncertain, do not hand off this turn, continue the narrative at a natural pace and guide it closer.
+- DIRECTION TARGET: An upcoming prewritten scene exists. Treat it as a private long-term destination for story direction, staging, character positioning, emotional setup, and momentum. Over many turns, guide the current narrative toward the exact conditions where that prewritten scene could begin immediately afterward. The goal is not to find a convenient fade-out. The goal is to narrate at a slow, natural pace as if these instructions didnt exist, naturally moving towards the next scene.
+- PACING AND HANDOFF SPEED: Do not transition too fast. It should take numerous turns to arrive at the next scene in most cases.Treat the upcoming prewritten scene as a long-term destination to earn through present-moment movement, not a marker to use at the first plausible pause.Prefer gradual movement toward the doorway of the upcoming prewritten scene over immediate marker use.Use the marker only when the current scene is already at the doorstep of the upcoming prewritten scene, or when the user's latest reply contains the user override marker.
+- LATE HANDOFF POLICY: Default to continuing the current narrative at a natural pace, NEVER try to 'bridge the gap' or arrive at the doorstep of the next scene unnaturally.Move steadily toward the upcoming prewritten scene over the course of several turns, keep writing the present moment until that prewritten scene is nearly ready to start.The handoff should usually happen at the latest viable point, often right before the prewritten scene would begin or at the instant it is about to begin.Do not hand off just because there is a calm moment, a completed emotional beat, a quiet pause, or a place where a normal scene ending would make sense. Do not use the marker as a fade to black, summary transition, curtain drop, chapter break, or convenient stopping point.
+- VALID HANDOFF THRESHOLD: Only hand off when the current scene has advanced to the doorstep of the upcoming prewritten scene.The next assistant message after the marker should be able to start the prewritten scene without needing extra setup, bridging, explanation, or repositioning.If another reply could still naturally move closer to the upcoming prewritten scene without contradicting the conversation, keep going instead of using the marker.When uncertain, do not hand off this turn, continue the narrative at a natural pace and guide it closer. NEVER timeskip multiple hours, days or weeks just to get to the threshold faster.
+– USER OVERRIDE TAG: If the user's latest reply contains ${USER_OVERRIDE_TAG}, make a best-effort attempt to reach the doorstep sooner, while still avoiding unnatural bridging.
+- HANDOFF TAG: When the doorstep is reached, include ${HANDOFF_TAG} once in your response. This is a private control tag; it will be removed before the user sees the message and the upcoming scene will be inserted automatically. The tag does not need to be at the end but must be on it's own line.
+- UPCOMING PREWRITTEN SCENE PRIVACY: Use the upcoming prewritten scene only as a target for deciding how to steer the current scene.
+- MANDATORY CONSTRAINT: Do not quote, summarize, paraphrase, adapt, preview, blend, or reuse any part of the prewritten scene. Do not use its URLs, images, formatting, headings, or exact details. DO NOT use it for anything other than a reference on what direction to guide the current scene. NEVER include ANY PORTION of the upcoming greeting in your response; it will be injected automatically when you send the marker.
 
 UPCOMING PREWRITTEN SCENE, FOR TIMING ONLY:
 ${prewrittenSceneExcerpt}
@@ -2001,9 +2141,9 @@ function buildStyles() {
   justify-content: center;
   gap: 6px;
   padding: 6px 9px;
-  color: var(--lumiverse-accent-text, #ffffff);
-  background: var(--lumiverse-accent, #3b82f6);
-  border: 1px solid var(--lumiverse-accent, #3b82f6);
+  color: var(--lumiverse-primary-contrast, #ffffff);
+  background: var(--lumiverse-primary, #3b82f6);
+  border: 1px solid var(--lumiverse-primary, #3b82f6);
   border-radius: 6px;
   font: inherit;
   font-size: 12px;
@@ -2014,12 +2154,12 @@ function buildStyles() {
 
 .ls-gi-button-secondary {
   color: var(--lumiverse-text, #f5f5f5);
-  background: var(--lumiverse-button-bg, rgba(255, 255, 255, 0.1));
+  background: var(--lumiverse-fill, rgba(255, 255, 255, 0.1));
   border-color: var(--lumiverse-border, rgba(255, 255, 255, 0.18));
 }
 
 .ls-gi-button-danger {
-  color: var(--lumiverse-danger-text, #ffffff);
+  color: #ffffff;
   background: var(--lumiverse-danger, #dc2626);
   border-color: var(--lumiverse-danger, #dc2626);
 }
@@ -2052,7 +2192,7 @@ function buildStyles() {
 .ls-gi-button[aria-disabled="true"] {
   opacity: 0.48;
   color: var(--lumiverse-text-muted, rgba(245, 245, 245, 0.72));
-  background: var(--lumiverse-bg-muted, rgba(255, 255, 255, 0.06));
+  background: var(--lumiverse-fill-subtle, rgba(255, 255, 255, 0.06));
   border-color: var(--lumiverse-border, rgba(255, 255, 255, 0.14));
   cursor: not-allowed;
 }
@@ -2091,7 +2231,7 @@ function buildStyles() {
 .ls-gi-checkbox {
   width: 14px;
   height: 14px;
-  accent-color: var(--lumiverse-accent, #3b82f6);
+  accent-color: var(--lumiverse-primary, #3b82f6);
 }
 
 .ls-gi-inline-label {
@@ -2107,7 +2247,7 @@ function buildStyles() {
   min-height: 28px;
   width: 72px;
   color: var(--lumiverse-text, #f5f5f5);
-  background: var(--lumiverse-input-bg, rgba(255, 255, 255, 0.08));
+  background: var(--lumiverse-fill, rgba(255, 255, 255, 0.08));
   border: 1px solid var(--lumiverse-border, rgba(255, 255, 255, 0.18));
   border-radius: 6px;
   padding: 4px 8px;
@@ -2211,7 +2351,7 @@ function buildStyles() {
   width: 100%;
   min-height: 38px;
   color: var(--lumiverse-text, #f5f5f5);
-  background: var(--lumiverse-input-bg, rgba(255, 255, 255, 0.08));
+  background: var(--lumiverse-fill, rgba(255, 255, 255, 0.08));
   border: 1px solid var(--lumiverse-border, rgba(255, 255, 255, 0.18));
   border-radius: 6px;
   padding: 8px 10px;
@@ -2950,14 +3090,15 @@ async function getLatestChatMessage() {
     const latestMessage =
       Array.isArray(messages) && messages.length > 0 ? messages[0] : null;
     const content = chatMessageContent(latestMessage);
-    const marker = analyzeSceneMarker(content);
+    const handoff = analyzeSceneHandoff(content, latestMessage && latestMessage.extra);
 
     logDebug("latest message read", {
       id: latestMessage && latestMessage.id,
       role: latestMessage && latestMessage.role,
-      marker: marker.hasMarker,
-      finalLine: marker.finalLine,
-      length: marker.length,
+      handoff: handoff.hasHandoff,
+      tags: handoff.tagCount,
+      extra: handoff.extraHandoff,
+      length: handoff.length,
     });
     return latestMessage;
   } catch (error) {
@@ -2966,7 +3107,7 @@ async function getLatestChatMessage() {
   }
 }
 
-async function getLatestMarkerMessage(expectedMessageId) {
+async function getLatestHandoffMessage(expectedMessageId) {
   const expectedId = asText(expectedMessageId);
   let latestMessage = null;
 
@@ -2979,66 +3120,91 @@ async function getLatestMarkerMessage(expectedMessageId) {
     }
 
     const content = chatMessageContent(latestMessage);
-    const marker = analyzeSceneMarker(content);
+    const handoff = analyzeSceneHandoff(content, latestMessage.extra);
     const latestId = asText(latestMessage.id);
 
-    logDebug("latest marker check", {
+    logDebug("latest handoff check", {
       attempt: attempt + 1,
       expectedId,
       latestId,
-      marker: marker.hasMarker,
-      finalLine: marker.finalLine,
+      handoff: handoff.hasHandoff,
+      tags: handoff.tagCount,
+      extra: handoff.extraHandoff,
     });
 
-    if (marker.hasMarker) {
+    if (handoff.hasHandoff) {
       return latestMessage;
     }
 
     await sleep(LATEST_MESSAGE_RETRY_DELAY_MS);
   }
 
-  return latestMessage && hasSceneChanged(chatMessageContent(latestMessage)) ?
+  return latestMessage && hasSceneChanged(chatMessageContent(latestMessage), latestMessage.extra) ?
       latestMessage
     : null;
 }
 
 async function resolveTransitionSource(eventName) {
+  if (data && data.message && isUserMessage(data.message)) {
+    logDebug("transition source ignored", { event: eventName, reason: "user message" });
+    return null;
+  }
+
   const directContent = transitionContentFromEvent();
   const directSourceId = transitionSourceIdFromEvent();
-  const directMarker = analyzeSceneMarker(directContent);
+  const directExtra = data && data.message ? data.message.extra : null;
+  const directHandoff = analyzeSceneHandoff(directContent, directExtra);
+  const pendingHandoff = takePendingHandoff(
+    eventChatId(eventName),
+    directSourceId,
+    directHandoff.content,
+  );
 
   logDebug("transition source check", {
     event: eventName,
     directSourceId,
-    directMarker: directMarker.hasMarker,
-    directFinalLine: directMarker.finalLine,
-    directLength: directMarker.length,
+    directHandoff: directHandoff.hasHandoff,
+    directTags: directHandoff.tagCount,
+    directExtra: directHandoff.extraHandoff,
+    pending: Boolean(pendingHandoff),
+    directLength: directHandoff.length,
   });
+
+  if (directHandoff.hasHandoff) {
+    return {
+      content: directHandoff.content,
+      sourceId: directSourceId,
+      hasHandoff: true,
+    };
+  }
+
+  if (pendingHandoff) {
+    return {
+      content: pendingHandoff.content,
+      sourceId: pendingHandoff.sourceId || directSourceId,
+      hasHandoff: true,
+    };
+  }
 
   if (
     eventName === "GENERATION_ENDED" ||
     eventName === "GENERATION_STOPPED" ||
-    eventName === "CHARACTER_MESSAGE_RENDERED" ||
-    eventName === "USER_MESSAGE_RENDERED"
+    eventName === "CHARACTER_MESSAGE_RENDERED"
   ) {
-    const latest = await getLatestMarkerMessage(directSourceId);
+    const latest = await getLatestHandoffMessage(directSourceId);
     if (latest) {
+      const latestHandoff = analyzeSceneHandoff(
+        chatMessageContent(latest),
+        latest.extra,
+      );
       return {
-        content: chatMessageContent(latest),
+        content: latestHandoff.content,
         sourceId: asText(latest.id) || directSourceId,
+        hasHandoff: true,
       };
     }
 
-    if (directMarker.hasMarker) {
-      logDebug("using direct transition payload fallback", { event: eventName });
-      return { content: directContent, sourceId: directSourceId };
-    }
-
     return null;
-  }
-
-  if (directMarker.hasMarker) {
-    return { content: directContent, sourceId: directSourceId };
   }
 
   return null;
@@ -3242,8 +3408,8 @@ async function maybeAdvanceForTransition(state, eventName) {
   }
 
   const source = await resolveTransitionSource(eventName);
-  if (!source || !hasSceneChanged(source.content)) {
-    logDebug("transition not advanced", { event: eventName, reason: "no marker" });
+  if (!source || !source.hasHandoff) {
+    logDebug("transition not advanced", { event: eventName, reason: "no handoff tag" });
     return { advanced: false, result: null };
   }
 
@@ -3660,6 +3826,7 @@ async function handleUiAction(action, options = {}) {
 async function teardown() {
   logDebug("teardown start");
   setBusyAction("");
+  unregisterHandoffContentProcessor();
   unsubscribeByKey(DRAWER_CLICK_UNSUB_KEY);
   unsubscribeByKey(DRAWER_CHANGE_UNSUB_KEY);
   unsubscribeByKey(FLOATING_CLICK_UNSUB_KEY);
@@ -3698,6 +3865,10 @@ async function main() {
     chatId: eventChatId(eventName),
     characterId: eventCharacterId(),
   });
+
+  if (!isTeardown(eventName)) {
+    await registerHandoffContentProcessor();
+  }
 
   if (eventName === "ls:startup" || eventName === "ls:reload") {
     clearCachedHandles();

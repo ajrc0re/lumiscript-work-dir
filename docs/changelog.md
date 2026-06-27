@@ -371,3 +371,160 @@ The big feature and parity cycle before GA
   - She remembers your preferences/project facts across chats (editable)
   - Attach reference files
 - Under the hood: a full pre-1.0 API-stability audit — public API, saved-data formats, events, and permissions reviewed and locked for the semver-strict v1.0 commitment, so scripts you write today keep working through 1.0
+
+### Update 1.1.0
+
+Fixes the reported Lisa chat degradation (responsiveness drops during use and a "Server connection lost" disconnect, both on long/code-heavy threads) and folds in a few user-requested enhancements. All changes are internal to the assistant; no `api.*` surface change, so the GA stability lock holds.
+
+**Load performance (the freeze + disconnect when opening a long thread):**
+
+- Render bubble content on-visible: each message defers its markdown + syntax-highlight render until an `IntersectionObserver` reports it near the viewport (raw text shown as a cheap placeholder until then; the streaming and last bubbles render eagerly so the part you land on never flashes). Opening a code-heavy thread previously markdown-parsed and Prism-highlighted every bubble in one synchronous commit, resulting in seconds of main-thread freeze that also starved the WebSocket heartbeat (the disconnect). Mount cost is now bounded to the visible window regardless of thread length or per-message size.
+- Fix loads-at-head on open: a load-keyed settle effect lands the view at the true tail despite content-visibility's height estimate (also fixes a latent no-scroll when switching to a same-length thread).
+
+**Streaming/steady-state render (the responsiveness drops during use):**
+
+- Kill the per-tick re-render storm: memoize the apply-context value (a churning `Provider` value was piercing `MarkdownContent`'s memo and re-running Prism on every code block at ~20 Hz), wrap `MessageBubble` in `React.memo`, and throttle reasoning tokens like content tokens. Also decouple the apply-context value from the `scripts` prop identity so an unrelated script autosave no longer re-highlights the open transcript.
+- Batch streamed tokens backend-side (~30 Hz) instead of one WebSocket frame per token; add content-visibility to off-screen bubbles; gate auto-scroll on "near bottom" + defer to rAF (no forced reflow per flush).
+
+**Backend correctness/cost:**
+
+- Route every assistant->frontend message to the active user (was broadcasting Lisa's stream/threads/memory to all sessions on multi-user servers).
+- Window the LLM context to the most recent turns (cut only at user-turn boundaries; full thread still persisted and displayed) so prompt cost and latency stop growing unbounded.
+- Compact thread persistence; abort the in-flight turn when the modal closes.
+
+**Edit & resend the last message:**
+
+- Hover the last user message -> pencil -> inline edit -> regenerate. The backend trims the last exchange (`tool_use`/`tool_result` pairs kept intact) and re-runs with the edited content via a new `editLast` flag.
+
+### Update 1.1.1
+
+v1.1.0's history windowing was meant to bound only the prompt sent to the model, leaving the full thread persisted and displayed. It didn't because I'm too smart for my own good, apparently. Context management is being reworked but this will at least stopgap against threads with more than 48 messages being silently trimmed from the top.
+
+### Update 1.2
+
+A full rework of Lisa's LLM context handling, built on a model-facing vs display history split (`buildModelHistory`) that makes the v1.1 data-loss class structurally impossible.
+
+- Token budget + gauge: windowHistory now bounds the prompt by a configurable token budget (`assistantContextTokens`, default 200K) instead of a fixed message count. A composer fullness gauge shows occupancy (persisted per-thread) with a click-popover breakdown — corpus/memories/chat/attachments.
+- Auto + manual compaction: past ~85% full, Lisa folds the older turns into a prose handoff PRE-turn (no re-entrancy race), keeping recent turns verbatim; the full thread is never altered. "Compact now" button + an auto-compact toggle. Durable cross-session facts are harvested into memory, behind a new per-user memory write lock so the harvest can't race the remember tool.
+- Prompt caching: the stable ~44K-token cheat-sheet prefix carries a `cache_control` breakpoint, so caching providers stop re-billing it every turn.
+- Tool-result cap: one oversized tool result can no longer blow the context or the transcript.
+
+### Update 1.3.0
+
+This one pairs a big performance fix for browsing `api.db` collections with a broad reliability sweep under the hood
+
+**Collection search, rebuilt**
+Filtering records in Storage -> Inspect used to crawl (even a small collection could hang for a few seconds per keystroke), that's finally gone:
+
+- Instant filtering: small collections now filter entirely in-browser, with no per-keystroke server round-trip, shallow, deep, and `jsonquery` modes all benefit
+- Smooth scrolling: record bodies now render lazily as they come into view, so a filter that surfaces lots of records no longer stutters
+- Match highlighting: your search term is now highlighted right inside the matching records, so you can see where it matched at a glance
+
+**Stability & performance hardening**
+
+- Closed a few concurrency races (rapid-fire assistant sends, memory consolidation vs. live edits)
+- Plugged some slow resource leaks (timers, abort listeners, stream teardown) under sustained load
+- Added a UI error boundary so a hiccup degrades gracefully instead of blanking the panel
+
+### Update 1.3.1
+
+A focused follow-up to the v1.3.0 performance & stability pass: faster `api.db`, a new collection-retention option, and a nicer Lisa apply flow
+
+- Collections are now cached in memory, so back-to-back reads (`find`/`findOne`/`count`/`query`) skip the round-trip to storage. Database-heavy scripts feel noticeably snappier and the cache is memory-bounded, so it stays light no matter how many collections you touch.
+- Collection retention (auto-pruning): Opt in per collection and old records prune themselves on insert, no more manual trimming if not needed (good for rolling logs, recent activity feeds, or any scratch state you don't want growing forever).
+- Lisa gets diff previews on "Apply to script"
+
+```js
+// keep only the newest 500 records
+await api.db.collection('eventlog', { retention: { maxRecords: 500 } });
+
+// or drop anything older than 24h
+await api.db.collection('recent', { retention: { maxAgeMs: 24 * 60 * 60 * 1000 } });
+```
+
+### Update 1.3.2
+
+**`api.chat.onMessageTag` — react to tags the model writes**
+
+Your scripts can now hook XML-style tags that appear in chat messages and run code when they show up. Perfect for inline interactivity: dice rolls, skill checks, trackers, scene/state triggers, custom widgets, anything keyed off what the model (or you) writes.
+
+```js
+// Fire whenever <dice>...</dice> shows up in a completed message
+const off = api.chat.onMessageTag('dice', (ev) => {
+  api.ui.toast(`🎲 rolled ${ev.content}`);
+}, { removeFromMessage: true }); // ...and strip the tag from the bubble
+// ev = { tagName, attrs, content, fullMatch, messageId, isUser, ... }
+// call off() to unsubscribe
+```
+
+- Filter by attributes: `onMessageTag('roll', fn, { attrs: { type: 'd20' } })`
+- Fires once per completed message (no mid-stream spam) and de-dupes across scroll/redraw
+- Multiple scripts can hook the same tag, they all fire
+- Requires the `chat_mutation` permission
+
+**Lisa got smarter**
+
+Lisa can now read your diagnostics, list your scripts, and read a script's source, so when you ask for help she reasons about your *actual* setup (granted permissions, errors, conflicts) instead of guessing.
+
+**More reliability**
+
+- Adopted ESLint with type-aware checks in manual builds and CI, a class of async bugs now gets caught automatically going forward
+- Fixed: a command handler that throws no longer leaks an unhandled rejection
+- Fixed: cold start is more resilient to storage hiccups
+
+### Update 1.3.3
+
+- `api.db.collection().drop()` now evicts the cached (scope, path) wrapper and releases its dispatcher persistent handle, not just the loaded-array data cache. A dropped collection no longer strands a stale wrapper + leaked handle; the next collection() call rebuilds a fresh wrapper (picking up any new schema instead of the pre-drop "first wins" one).
+- `LumiScriptPanel` wraps its tab content in one keyed `<ErrorBoundary key={activeTab}>` so a render crash in a single tab (manage/status/storage) degrades to a localized fallback and recovers on tab switch, instead of blanking the whole dock.
+- New `editorIntellisense` setting (default on) in Settings -> Editor toggle: when off, Monaco suppresses the autocomplete popup, trigger-char suggestions, signature help, and hover docs (syntax-error squiggles unaffected). Applied via reactive editor options, so it takes effect without a remount. Existing users default to on via the settings-store key merge.
+
+### Update 1.4.0
+
+You can now bundle LumiScript scripts into character cards!
+
+**Authoring**
+
+- Bundle into card button in the script-manager toolbar: pick scripts and a target character
+- A new LumiScript tab (thanks <@944783522059673691> for the API) right inside the character editor: view a card's bundled scripts, delete them, add more from your library, or import them, all on the character you're editing
+
+**Importing**
+
+- Importing a card with bundled scripts raises a per-script consent modal: review each one, see its event hooks and any permissions it wants, pick what to install, everything lands disabled and never auto-runs; you read the code and enable it yourself
+- Re-importing an updated card offers updates (newer version wins)
+- Opening a chat with a character that bundles scripts you don't have in the library produces a Manage tab reminder; can be dismissed for the session; it's back next launch, and the editor tab's Import to library feature is always there if you decide to import them
+
+**Safety**
+
+- Nothing auto-enables, auto-runs, or self-grants a permission, the import side treats the card as untrusted JSON and clamps it defensively
+
+For anyone interested, bundled scripts live in the card's `"extensions"` field, with the following schema:
+
+```json
+{
+  "lumiscript": {
+    "formatVersion": 1,
+    "bundleCardId": "d61d4d25-9fb2-4654-8bd5-e576cb91dfff",
+    "scripts": [
+      {
+        "bundleId": "02d6476e-45f9-4740-879b-4b33636423b4",
+        "name": "x",
+        "code": "console.log(data);\n",
+        "type": "trigger",
+        "triggers": [
+          "MESSAGE_SENT"
+        ]
+      }
+    ]
+  }
+}
+```
+
+### Update 1.4.2
+
+Lisa's chat button now lives in the script-manager toolbar (right next to the bundle button), so it's where you're actually working. Removed the old one from extension settings, where nobody was looking for it.
+
+### Update 1.5.0
+
+- Lisa speaks CSS now! She knows Lumiverse's full `--lumiverse-*` theme element system, so she can actually help you theme the app, write `api.theme` calls, or hand-roll `addStyle` CSS against the real elements.
+- Tidier code blocks in Lisa's chat: Copy/Apply moved into a clean header bar above the code (no more buttons overlapping the first line), with a language tag. Every block gets the toolbar now, even untagged ones.
+- New theme element reference in the docs and cookbook.
