@@ -1,5 +1,5 @@
 // @ls:reload-on-edit
-const VERSION = "2026-06-26-stronger-prompt";
+const VERSION = "2026-06-27-prewritten-injection-tags";
 
 const INJECTION_ID = "greeting-inspector-next-scene-note";
 const DRAWER_TAB_ID = "greeting-inspector-status";
@@ -34,14 +34,14 @@ const OLD_CHAT_VARIABLE_KEYS = {
   [LAST_ADVANCED_SIGNATURE_VAR]: OLD_LAST_ADVANCED_SIGNATURE_VAR,
 };
 
-const HANDOFF_TAG_NAME = "scene-handoff";
-const USER_OVERRIDE_TAG_NAME = "scene-handoff-now";
+const HANDOFF_TAG_NAME = "inject-prewritten-content";
+const USER_OVERRIDE_TAG_NAME = "request-prewritten-injection";
 const HANDOFF_TAG = `<${HANDOFF_TAG_NAME} />`;
 const USER_OVERRIDE_TAG = `<${USER_OVERRIDE_TAG_NAME} />`;
 const HANDOFF_EXTRA_KEY = "greetingInspectorSceneHandoff";
 const HANDOFF_CONTENT_PROCESSOR_ID = "greeting-inspector-scene-handoff-tags";
 const HANDOFF_TAG_PATTERN =
-  /<\s*scene-handoff\b(?:[^>"']|"[^"]*"|'[^']*')*\/\s*>|<\s*scene-handoff\b(?:[^>"']|"[^"]*"|'[^']*')*>([\s\S]*?)<\s*\/\s*scene-handoff\s*>/gi;
+  /<\s*inject-prewritten-content\b(?:[^>"']|"[^"]*"|'[^']*')*\/\s*>|<\s*inject-prewritten-content\b(?:[^>"']|"[^"]*"|'[^']*')*>([\s\S]*?)<\s*\/\s*inject-prewritten-content\s*>/gi;
 
 const DRAWER_TAB_KEY = "__greetingInspectorDrawerTabV3";
 const DRAWER_CLICK_UNSUB_KEY = "__greetingInspectorDrawerClickUnsubV3";
@@ -1963,8 +1963,8 @@ function buildAuthorNote(prewrittenScene) {
 - PACING AND HANDOFF SPEED: Do not transition too fast. It should take numerous turns to arrive at the next scene in most cases.Treat the upcoming prewritten scene as a long-term destination to earn through present-moment movement, not a marker to use at the first plausible pause.Prefer gradual movement toward the doorway of the upcoming prewritten scene over immediate marker use.Use the marker only when the current scene is already at the doorstep of the upcoming prewritten scene, or when the user's latest reply contains the user override marker.
 - LATE HANDOFF POLICY: Default to continuing the current narrative at a natural pace, NEVER try to 'bridge the gap' or arrive at the doorstep of the next scene unnaturally.Move steadily toward the upcoming prewritten scene over the course of several turns, keep writing the present moment until that prewritten scene is nearly ready to start.The handoff should usually happen at the latest viable point, often right before the prewritten scene would begin or at the instant it is about to begin.Do not hand off just because there is a calm moment, a completed emotional beat, a quiet pause, or a place where a normal scene ending would make sense. Do not use the marker as a fade to black, summary transition, curtain drop, chapter break, or convenient stopping point.
 - VALID HANDOFF THRESHOLD: Only hand off when the current scene has advanced to the doorstep of the upcoming prewritten scene.The next assistant message after the marker should be able to start the prewritten scene without needing extra setup, bridging, explanation, or repositioning.If another reply could still naturally move closer to the upcoming prewritten scene without contradicting the conversation, keep going instead of using the marker.When uncertain, do not hand off this turn, continue the narrative at a natural pace and guide it closer. NEVER timeskip multiple hours, days or weeks just to get to the threshold faster.
-– USER OVERRIDE TAG: If the user's latest reply contains ${USER_OVERRIDE_TAG}, make a best-effort attempt to reach the doorstep sooner, while still avoiding unnatural bridging.
-- HANDOFF TAG: When the doorstep is reached, include ${HANDOFF_TAG} once in your response. This is a private control tag; it will be removed before the user sees the message and the upcoming scene will be inserted automatically. The tag does not need to be at the end but must be on it's own line.
+– USER INJECTION REQUEST TAG: If the user's latest reply contains ${USER_OVERRIDE_TAG}, make a best-effort attempt to reach the doorstep sooner, while still avoiding unnatural bridging. This request does not by itself mean the prewritten content is ready to inject.
+- PREWRITTEN CONTENT INJECTION TAG: Only when the doorstep is reached, include ${HANDOFF_TAG} once in your response. This private control tag has exactly one purpose: instruct the host to inject the upcoming prewritten content. It is not a general marker for ending a narrative beat, passage, chapter, or other natural stopping point. It will be removed before the user sees the message. The tag does not need to be at the end but must be on its own line.
 - UPCOMING PREWRITTEN SCENE PRIVACY: Use the upcoming prewritten scene only as a target for deciding how to steer the current scene.
 - MANDATORY CONSTRAINT: Do not quote, summarize, paraphrase, adapt, preview, blend, or reuse any part of the prewritten scene. Do not use its URLs, images, formatting, headings, or exact details. DO NOT use it for anything other than a reference on what direction to guide the current scene. NEVER include ANY PORTION of the upcoming greeting in your response; it will be injected automatically when you send the marker.
 
