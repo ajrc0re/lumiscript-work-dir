@@ -1,5 +1,5 @@
 // @ls:reload-on-edit
-const VERSION = "2026-06-27-prewritten-injection-tags";
+const VERSION = "2026-06-30-global-prompt-settings";
 
 const INJECTION_ID = "greeting-inspector-next-scene-note";
 const DRAWER_TAB_ID = "greeting-inspector-status";
@@ -17,6 +17,7 @@ const ACTIVE_STATUS_VAR = "GreetingInspectorActive";
 const CONTENT_VAR = "GreetingInspectorContent";
 const AUTO_INJECT_VAR = "GreetingInspectorAutoInject";
 const AUTO_INJECT_POSITION_VAR = "GreetingInspectorAutoInjectPosition";
+const PROMPT_EXCLUDE_REGEX_VAR = "GreetingInspectorPromptExcludeRegex";
 const ENABLED_VAR = "GreetingInspectorEnabled";
 const DEBUG_VAR = "GreetingInspectorDebug";
 const GROUP_CHARACTER_STATE_VAR = "GreetingInspectorGroupCharacterState";
@@ -42,6 +43,22 @@ const HANDOFF_EXTRA_KEY = "greetingInspectorSceneHandoff";
 const HANDOFF_CONTENT_PROCESSOR_ID = "greeting-inspector-scene-handoff-tags";
 const HANDOFF_TAG_PATTERN =
   /<\s*inject-prewritten-content\b(?:[^>"']|"[^"]*"|'[^']*')*\/\s*>|<\s*inject-prewritten-content\b(?:[^>"']|"[^"]*"|'[^']*')*>([\s\S]*?)<\s*\/\s*inject-prewritten-content\s*>/gi;
+
+function buildShapeSceneDirectionPrompt(prewrittenSceneExcerpt) {
+  return `<shape_scene_direction>
+- DIRECTION TARGET: An upcoming prewritten scene exists. Treat it as a private long-term destination for story direction, staging, character positioning, emotional setup, and momentum. Over many turns, guide the current narrative toward the exact conditions where that prewritten scene could begin immediately afterward. The goal is not to find a convenient fade-out. The goal is to narrate at a slow, natural pace as if these instructions didnt exist, naturally moving towards the next scene.
+- PACING AND HANDOFF SPEED: Do not transition too fast. It should take numerous turns to arrive at the next scene in most cases.Treat the upcoming prewritten scene as a long-term destination to earn through present-moment movement, not a marker to use at the first plausible pause.Prefer gradual movement toward the doorway of the upcoming prewritten scene over immediate marker use.Use the marker only when the current scene is already at the doorstep of the upcoming prewritten scene, or when the user's latest reply contains the user override marker.
+- LATE HANDOFF POLICY: Default to continuing the current narrative at a natural pace, NEVER try to 'bridge the gap' or arrive at the doorstep of the next scene unnaturally.Move steadily toward the upcoming prewritten scene over the course of several turns, keep writing the present moment until that prewritten scene is nearly ready to start.The handoff should usually happen at the latest viable point, often right before the prewritten scene would begin or at the instant it is about to begin.Do not hand off just because there is a calm moment, a completed emotional beat, a quiet pause, or a place where a normal scene ending would make sense. Do not use the marker as a fade to black, summary transition, curtain drop, chapter break, or convenient stopping point.
+- VALID HANDOFF THRESHOLD: Only hand off when the current scene has advanced to the doorstep of the upcoming prewritten scene.The next assistant message after the marker should be able to start the prewritten scene without needing extra setup, bridging, explanation, or repositioning.If another reply could still naturally move closer to the upcoming prewritten scene without contradicting the conversation, keep going instead of using the marker.When uncertain, do not hand off this turn, continue the narrative at a natural pace and guide it closer. NEVER timeskip multiple hours, days or weeks just to get to the threshold faster.
+– USER INJECTION REQUEST TAG: If the user's latest reply contains ${USER_OVERRIDE_TAG}, make a best-effort attempt to reach the doorstep sooner, while still avoiding unnatural bridging. This request does not by itself mean the prewritten content is ready to inject.
+- PREWRITTEN CONTENT INJECTION TAG: Only when the doorstep is reached, include ${HANDOFF_TAG} once in your response. This private control tag has exactly one purpose: instruct the host to inject the upcoming prewritten content. It is not a general marker for ending a narrative beat, passage, chapter, or other natural stopping point. It will be removed before the user sees the message. The tag does not need to be at the end but must be on its own line.
+- UPCOMING PREWRITTEN SCENE PRIVACY: Use the upcoming prewritten scene only as a target for deciding how to steer the current scene.
+- MANDATORY CONSTRAINT: Do not quote, summarize, paraphrase, adapt, preview, blend, or reuse any part of the prewritten scene. Do not use its URLs, images, formatting, headings, or exact details. DO NOT use it for anything other than a reference on what direction to guide the current scene. NEVER include ANY PORTION of the upcoming greeting in your response; it will be injected automatically when you send the marker.
+
+UPCOMING PREWRITTEN SCENE, FOR TIMING ONLY:
+${prewrittenSceneExcerpt}
+</shape_scene_direction>`;
+}
 
 const DRAWER_TAB_KEY = "__greetingInspectorDrawerTabV3";
 const DRAWER_CLICK_UNSUB_KEY = "__greetingInspectorDrawerClickUnsubV3";
@@ -188,6 +205,127 @@ function normalizeAutoInjectPosition(value) {
     AUTO_INJECT_MIN_POSITION,
     Math.min(position, AUTO_INJECT_MAX_POSITION),
   );
+}
+
+function stripExtendedRegexSyntax(pattern) {
+  let result = "";
+  let escaped = false;
+  let inCharacterClass = false;
+
+  for (let index = 0; index < pattern.length; index += 1) {
+    const character = pattern[index];
+
+    if (escaped) {
+      result += character;
+      escaped = false;
+      continue;
+    }
+
+    if (character === "\\") {
+      result += character;
+      escaped = true;
+      continue;
+    }
+
+    if (character === "[" && !inCharacterClass) {
+      inCharacterClass = true;
+      result += character;
+      continue;
+    }
+
+    if (character === "]" && inCharacterClass) {
+      inCharacterClass = false;
+      result += character;
+      continue;
+    }
+
+    if (!inCharacterClass && character === "#") {
+      while (index + 1 < pattern.length && !/[\r\n]/.test(pattern[index + 1])) {
+        index += 1;
+      }
+      continue;
+    }
+
+    if (!inCharacterClass && /\s/.test(character)) {
+      continue;
+    }
+
+    result += character;
+  }
+
+  return result;
+}
+
+function parseRegexLiteral(value) {
+  const literal = asText(value);
+  if (!literal) {
+    return { literal: "", regex: null };
+  }
+
+  if (!literal.startsWith("/")) {
+    throw new Error("Regex must start and end with / characters.");
+  }
+
+  let closingSlash = -1;
+  let escaped = false;
+  let inCharacterClass = false;
+
+  for (let index = 1; index < literal.length; index += 1) {
+    const character = literal[index];
+
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+
+    if (character === "\\") {
+      escaped = true;
+      continue;
+    }
+
+    if (character === "[" && !inCharacterClass) {
+      inCharacterClass = true;
+      continue;
+    }
+
+    if (character === "]" && inCharacterClass) {
+      inCharacterClass = false;
+      continue;
+    }
+
+    if (character === "/" && !inCharacterClass) {
+      closingSlash = index;
+      break;
+    }
+  }
+
+  if (closingSlash < 0) {
+    throw new Error("Regex must start and end with / characters.");
+  }
+
+  const flags = literal.slice(closingSlash + 1);
+  if (!/^[gmisx]*$/.test(flags)) {
+    throw new Error("Regex flags may only contain g, m, i, s, or x.");
+  }
+
+  if (new Set(flags).size !== flags.length) {
+    throw new Error("Regex flags cannot be repeated.");
+  }
+
+  const rawPattern = literal.slice(1, closingSlash);
+  const pattern = flags.includes("x") ? stripExtendedRegexSyntax(rawPattern) : rawPattern;
+  const nativeFlags = flags.replace(/x/g, "");
+
+  try {
+    return { literal, regex: new RegExp(pattern, nativeFlags) };
+  } catch (error) {
+    throw new Error(`Invalid regex: ${error.message || String(error)}`);
+  }
+}
+
+function applyPromptExcludeRegex(content, literal) {
+  const parsed = parseRegexLiteral(literal);
+  return parsed.regex ? String(content ?? "").replace(parsed.regex, "") : String(content ?? "");
 }
 
 function greetingLabel(index) {
@@ -1366,73 +1504,106 @@ async function writeScopedCharacterValue(scope, key, value, options = {}) {
   };
 }
 
+async function readGlobalSetting(key, fallback, persist, normalize, legacyReader = null) {
+  const hasStoredValue = await hasVariable(api.variables.global, key);
+  const stored =
+    hasStoredValue ? await getVariable(api.variables.global, key, fallback)
+    : typeof legacyReader === "function" ? await legacyReader()
+    : fallback;
+  let value;
+
+  try {
+    value = normalize(stored);
+  } catch (error) {
+    value = normalize(fallback);
+    logDebug("global setting reset", { key, error: error.message || String(error) });
+  }
+
+  if (persist && (!hasStoredValue || !valuesEqual(stored, value))) {
+    await setVariable(api.variables.global, key, value);
+  }
+
+  return value;
+}
+
+async function writeGlobalSetting(key, value, normalize) {
+  const normalizedValue = normalize(value);
+  requireVariableWrite(
+    await setVariable(api.variables.global, key, normalizedValue),
+    key,
+  );
+
+  const storedExists = await hasVariable(api.variables.global, key);
+  const stored = await getVariable(api.variables.global, key, null);
+  if (!storedExists || !valuesEqual(normalize(stored), normalizedValue)) {
+    throw new Error(`Could not confirm ${key}; refresh before trying again.`);
+  }
+
+  return normalizedValue;
+}
+
 async function readAutoInject(scope, persist = true) {
-  const enabled = await readScopedCharacterValue(
-    scope,
+  const enabled = await readGlobalSetting(
     AUTO_INJECT_VAR,
     false,
     persist,
-    (stored) => asBoolean(stored),
+    asBoolean,
+    () => readScopedCharacterValue(scope, AUTO_INJECT_VAR, false, false, asBoolean),
   );
 
-  logDebug("auto prompt read", {
-    enabled,
-    characterId: scope && scope.characterId,
-    groupScoped: scope && scope.groupScoped,
-  });
+  logDebug("global auto prompt read", { enabled });
   return enabled;
 }
 
-async function writeAutoInject(scope, enabled) {
-  const normalizedValue = Boolean(enabled);
-  const result = await writeScopedCharacterValue(
-    scope,
-    AUTO_INJECT_VAR,
-    normalizedValue,
-    { required: true },
-  );
-
-  if (!result.storedExists || asBoolean(result.stored) !== normalizedValue) {
-    throw new Error(`Could not confirm ${AUTO_INJECT_VAR}; refresh before trying again.`);
-  }
-
-  return normalizedValue;
+async function writeAutoInject(enabled) {
+  return writeGlobalSetting(AUTO_INJECT_VAR, Boolean(enabled), asBoolean);
 }
 
 async function readAutoInjectPosition(scope, persist = true) {
-  const position = await readScopedCharacterValue(
-    scope,
+  const position = await readGlobalSetting(
     AUTO_INJECT_POSITION_VAR,
     AUTO_INJECT_MIN_POSITION,
     persist,
-    (stored) => normalizeAutoInjectPosition(stored),
+    normalizeAutoInjectPosition,
+    () => readScopedCharacterValue(
+      scope,
+      AUTO_INJECT_POSITION_VAR,
+      AUTO_INJECT_MIN_POSITION,
+      false,
+      normalizeAutoInjectPosition,
+    ),
   );
 
-  logDebug("auto prompt position read", {
-    position,
-    characterId: scope && scope.characterId,
-    groupScoped: scope && scope.groupScoped,
-  });
+  logDebug("global auto prompt position read", { position });
   return position;
 }
 
-async function writeAutoInjectPosition(scope, position) {
-  const normalizedValue = normalizeAutoInjectPosition(position);
-  const result = await writeScopedCharacterValue(
-    scope,
+async function writeAutoInjectPosition(position) {
+  return writeGlobalSetting(
     AUTO_INJECT_POSITION_VAR,
-    normalizedValue,
-    { required: true },
+    position,
+    normalizeAutoInjectPosition,
+  );
+}
+
+async function readPromptExcludeRegex(persist = true) {
+  const literal = await readGlobalSetting(
+    PROMPT_EXCLUDE_REGEX_VAR,
+    "",
+    persist,
+    (value) => parseRegexLiteral(value).literal,
   );
 
-  if (
-    !result.storedExists ||
-    normalizeAutoInjectPosition(result.stored) !== normalizedValue
-  ) {
-    throw new Error(`Could not confirm ${AUTO_INJECT_POSITION_VAR}; refresh before trying again.`);
-  }
+  logDebug("global prompt exclude regex read", { literal: literal || "(disabled)" });
+  return literal;
+}
 
-  return normalizedValue;
+async function writePromptExcludeRegex(value) {
+  return writeGlobalSetting(
+    PROMPT_EXCLUDE_REGEX_VAR,
+    value,
+    (candidate) => parseRegexLiteral(candidate).literal,
+  );
 }
 
 async function readInspectorEnabled(scope, persist = true) {
@@ -1473,76 +1644,6 @@ async function writeInspectorActive(scope, active) {
 }
 
 async function writeInspectorContent(scope, content) {
-  await setVariable(
-    api.variables.character,
-    CONTENT_VAR,
-    typeof content === "string" ? content : "",
-  );
-}
-
-/*
- * Legacy helpers kept for migration context. Group-aware state uses the
- * selection helpers below instead of bare per-chat indices.
- */
-async function readAutoInjectLegacy(persist = true) {
-  const hasStoredValue = await hasVariable(api.variables.character, AUTO_INJECT_VAR);
-  const stored = await getVariable(api.variables.character, AUTO_INJECT_VAR, false);
-  const enabled = asBoolean(stored);
-
-  if (persist && (!hasStoredValue || stored !== enabled)) {
-    await setVariable(api.variables.character, AUTO_INJECT_VAR, enabled);
-  }
-
-  logDebug("auto prompt read", { enabled });
-  return enabled;
-}
-
-async function writeAutoInjectLegacy(enabled) {
-  const normalizedValue = Boolean(enabled);
-  const wrote = await setVariable(api.variables.character, AUTO_INJECT_VAR, normalizedValue);
-  requireVariableWrite(wrote, AUTO_INJECT_VAR);
-
-  const storedExists = await hasVariable(api.variables.character, AUTO_INJECT_VAR);
-  const stored = await getVariable(api.variables.character, AUTO_INJECT_VAR, null);
-  if (!storedExists || asBoolean(stored) !== normalizedValue) {
-    throw new Error(`Could not confirm ${AUTO_INJECT_VAR}; refresh before trying again.`);
-  }
-
-  return normalizedValue;
-}
-
-async function readInspectorEnabledLegacy(persist = true) {
-  const hasStoredValue = await hasVariable(api.variables.character, ENABLED_VAR);
-  const stored = await getVariable(api.variables.character, ENABLED_VAR, true);
-  const enabled = hasStoredValue ? asBoolean(stored) : true;
-
-  if (persist && (!hasStoredValue || stored !== enabled)) {
-    await setVariable(api.variables.character, ENABLED_VAR, enabled);
-  }
-
-  logDebug("inspector enabled read", { enabled });
-  return enabled;
-}
-
-async function writeInspectorEnabledLegacy(enabled) {
-  const normalizedValue = Boolean(enabled);
-  const wrote = await setVariable(api.variables.character, ENABLED_VAR, normalizedValue);
-  requireVariableWrite(wrote, ENABLED_VAR);
-
-  const storedExists = await hasVariable(api.variables.character, ENABLED_VAR);
-  const stored = await getVariable(api.variables.character, ENABLED_VAR, null);
-  if (!storedExists || asBoolean(stored) !== normalizedValue) {
-    throw new Error(`Could not confirm ${ENABLED_VAR}; refresh before trying again.`);
-  }
-
-  return normalizedValue;
-}
-
-async function writeInspectorActiveLegacy(active) {
-  await setVariable(api.variables.character, ACTIVE_STATUS_VAR, Boolean(active));
-}
-
-async function writeInspectorContentLegacy(content) {
   await setVariable(
     api.variables.character,
     CONTENT_VAR,
@@ -1898,6 +1999,7 @@ async function loadState(options = {}) {
     scope,
     persistDerivedState,
   );
+  const promptExcludeRegex = await readPromptExcludeRegex(persistDerivedState);
 
   const state = {
     ready: true,
@@ -1917,6 +2019,7 @@ async function loadState(options = {}) {
     upcomingIndex: upcomingSelection ? upcomingSelection.index : null,
     autoInject,
     autoInjectPosition,
+    promptExcludeRegex,
     inspectorEnabled,
     busyAction: getBusyAction(),
     sync: null,
@@ -1932,6 +2035,7 @@ async function loadState(options = {}) {
     upcoming: upcomingSelection ? selectionKey(upcomingSelection) : "none",
     autoInject,
     autoInjectPosition,
+    promptExcludeRegex: promptExcludeRegex || "(disabled)",
   });
 
   return state;
@@ -1952,25 +2056,14 @@ async function removeInjectedNote() {
   }
 }
 
-function buildAuthorNote(prewrittenScene) {
-  const prewrittenSceneExcerpt = prewrittenScene.slice(
+function buildAuthorNote(prewrittenScene, promptExcludeRegex) {
+  const filteredScene = applyPromptExcludeRegex(prewrittenScene, promptExcludeRegex);
+  const prewrittenSceneExcerpt = filteredScene.slice(
     0,
     PREWRITTEN_SCENE_PROMPT_CHAR_LIMIT,
   );
 
-  return `<shape_scene_direction>
-- DIRECTION TARGET: An upcoming prewritten scene exists. Treat it as a private long-term destination for story direction, staging, character positioning, emotional setup, and momentum. Over many turns, guide the current narrative toward the exact conditions where that prewritten scene could begin immediately afterward. The goal is not to find a convenient fade-out. The goal is to narrate at a slow, natural pace as if these instructions didnt exist, naturally moving towards the next scene.
-- PACING AND HANDOFF SPEED: Do not transition too fast. It should take numerous turns to arrive at the next scene in most cases.Treat the upcoming prewritten scene as a long-term destination to earn through present-moment movement, not a marker to use at the first plausible pause.Prefer gradual movement toward the doorway of the upcoming prewritten scene over immediate marker use.Use the marker only when the current scene is already at the doorstep of the upcoming prewritten scene, or when the user's latest reply contains the user override marker.
-- LATE HANDOFF POLICY: Default to continuing the current narrative at a natural pace, NEVER try to 'bridge the gap' or arrive at the doorstep of the next scene unnaturally.Move steadily toward the upcoming prewritten scene over the course of several turns, keep writing the present moment until that prewritten scene is nearly ready to start.The handoff should usually happen at the latest viable point, often right before the prewritten scene would begin or at the instant it is about to begin.Do not hand off just because there is a calm moment, a completed emotional beat, a quiet pause, or a place where a normal scene ending would make sense. Do not use the marker as a fade to black, summary transition, curtain drop, chapter break, or convenient stopping point.
-- VALID HANDOFF THRESHOLD: Only hand off when the current scene has advanced to the doorstep of the upcoming prewritten scene.The next assistant message after the marker should be able to start the prewritten scene without needing extra setup, bridging, explanation, or repositioning.If another reply could still naturally move closer to the upcoming prewritten scene without contradicting the conversation, keep going instead of using the marker.When uncertain, do not hand off this turn, continue the narrative at a natural pace and guide it closer. NEVER timeskip multiple hours, days or weeks just to get to the threshold faster.
-– USER INJECTION REQUEST TAG: If the user's latest reply contains ${USER_OVERRIDE_TAG}, make a best-effort attempt to reach the doorstep sooner, while still avoiding unnatural bridging. This request does not by itself mean the prewritten content is ready to inject.
-- PREWRITTEN CONTENT INJECTION TAG: Only when the doorstep is reached, include ${HANDOFF_TAG} once in your response. This private control tag has exactly one purpose: instruct the host to inject the upcoming prewritten content. It is not a general marker for ending a narrative beat, passage, chapter, or other natural stopping point. It will be removed before the user sees the message. The tag does not need to be at the end but must be on its own line.
-- UPCOMING PREWRITTEN SCENE PRIVACY: Use the upcoming prewritten scene only as a target for deciding how to steer the current scene.
-- MANDATORY CONSTRAINT: Do not quote, summarize, paraphrase, adapt, preview, blend, or reuse any part of the prewritten scene. Do not use its URLs, images, formatting, headings, or exact details. DO NOT use it for anything other than a reference on what direction to guide the current scene. NEVER include ANY PORTION of the upcoming greeting in your response; it will be injected automatically when you send the marker.
-
-UPCOMING PREWRITTEN SCENE, FOR TIMING ONLY:
-${prewrittenSceneExcerpt}
-</shape_scene_direction>`;
+  return buildShapeSceneDirectionPrompt(prewrittenSceneExcerpt);
 }
 
 async function syncNextSceneContext(state) {
@@ -1994,7 +2087,7 @@ async function syncNextSceneContext(state) {
     return { hasContent: false, injected: false, error: "" };
   }
 
-  const content = buildAuthorNote(nextGreeting.text);
+  const content = buildAuthorNote(nextGreeting.text, state.promptExcludeRegex);
 
   if (!state.autoInject) {
     await removeInjectedNote();
@@ -2255,6 +2348,29 @@ function buildStyles() {
   font-size: 12px;
 }
 
+.ls-gi-settings-header,
+.ls-gi-regex-field {
+  display: grid;
+  gap: 4px;
+}
+
+.ls-gi-settings-title {
+  color: var(--lumiverse-text, #f5f5f5);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.ls-gi-text-input {
+  width: 100%;
+  min-height: 32px;
+  color: var(--lumiverse-text, #f5f5f5);
+  background: var(--lumiverse-fill, rgba(255, 255, 255, 0.08));
+  border: 1px solid var(--lumiverse-border, rgba(255, 255, 255, 0.18));
+  border-radius: 6px;
+  padding: 6px 8px;
+  font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+}
+
 .ls-gi-preview-grid {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
@@ -2510,6 +2626,12 @@ function buildDrawerHtml(state) {
         <button class="ls-gi-button ls-gi-button-danger" id="ls-gi-force" data-action="force" type="button"${busyAction || !upcomingGreeting ? " disabled" : ""}><span>Force</span></button>
       </div>
     </div>
+  </div>
+  <div class="ls-gi-status ls-gi-settings">
+    <div class="ls-gi-settings-header">
+      <div class="ls-gi-settings-title">Settings</div>
+      <div class="ls-gi-meta">Global across characters, chats, restarts, and ON/OFF toggles.</div>
+    </div>
     <div class="ls-gi-option-row">
       <label class="ls-gi-checkbox-label" for="ls-gi-auto-prompt">
         <input class="ls-gi-checkbox" id="ls-gi-auto-prompt" type="checkbox"${state.autoInject ? " checked" : ""}${busyAction ? " disabled" : ""}>
@@ -2521,6 +2643,11 @@ function buildDrawerHtml(state) {
       </label>
       <div class="ls-gi-message">${escapeHtml(promptMessage)}</div>
     </div>
+    <label class="ls-gi-regex-field" for="ls-gi-prompt-exclude-regex">
+      <span class="ls-gi-inline-label">Prompt exclude regex</span>
+      <input class="ls-gi-text-input" id="ls-gi-prompt-exclude-regex" type="text" value="${escapeHtml(state.promptExcludeRegex || "")}" placeholder="/pattern/gmixs" autocomplete="off" spellcheck="false"${busyAction ? " disabled" : ""}>
+      <span class="ls-gi-meta">Optional. Matches are removed before the upcoming scene is truncated and added to the prompt. Use /pattern/flags; supported flags: g, m, i, s, x.</span>
+    </label>
   </div>
   <div class="ls-gi-preview-grid">
     <section class="ls-gi-preview">
@@ -2656,6 +2783,14 @@ async function attachDrawerHandlers(root) {
       await handleUiAction("autoPosition", {
         source: "drawer",
         position: event.targetValue,
+      });
+      return;
+    }
+
+    if (event.targetId === "ls-gi-prompt-exclude-regex") {
+      await handleUiAction("promptExcludeRegex", {
+        source: "drawer",
+        value: event.targetValue,
       });
     }
   });
@@ -3708,7 +3843,7 @@ async function handleAutoPromptChange(checked) {
     return;
   }
 
-  await writeAutoInject(state.scope, checked);
+  await writeAutoInject(checked);
   const refreshedState = await refreshPipeline({ reason: "auto prompt committed" });
 
   if (!refreshedState.ready) {
@@ -3729,7 +3864,7 @@ async function handleAutoPositionChange(position) {
     return;
   }
 
-  await writeAutoInjectPosition(state.scope, position);
+  await writeAutoInjectPosition(position);
   const refreshedState = await refreshPipeline({ reason: "auto position committed" });
 
   if (!refreshedState.ready) {
@@ -3739,6 +3874,16 @@ async function handleAutoPositionChange(position) {
 
   api.ui.toast(
     `Auto prompt within position ${normalizeAutoInjectPosition(refreshedState.autoInjectPosition)}. ${promptContentMessage(refreshedState.sync)}`,
+    refreshedState.sync && refreshedState.sync.error ? "warning" : "success",
+  );
+}
+
+async function handlePromptExcludeRegexChange(value) {
+  const literal = await writePromptExcludeRegex(value);
+  const refreshedState = await refreshPipeline({ reason: "prompt exclude regex committed" });
+
+  api.ui.toast(
+    literal ? `Prompt exclude regex saved: ${literal}` : "Prompt exclude regex disabled.",
     refreshedState.sync && refreshedState.sync.error ? "warning" : "success",
   );
 }
@@ -3810,6 +3955,11 @@ async function handleUiAction(action, options = {}) {
 
     if (action === "autoPosition") {
       await handleAutoPositionChange(options.position);
+      return;
+    }
+
+    if (action === "promptExcludeRegex") {
+      await handlePromptExcludeRegexChange(options.value);
       return;
     }
 
