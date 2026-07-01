@@ -1,5 +1,5 @@
 // @ls:reload-on-edit
-const VERSION = "2026-06-30-global-prompt-settings";
+const VERSION = "2026-06-30-persistent-auto-prompt";
 
 const INJECTION_ID = "greeting-inspector-next-scene-note";
 const DRAWER_TAB_ID = "greeting-inspector-status";
@@ -2109,7 +2109,7 @@ async function syncNextSceneContext(state) {
       mode: "intercept",
       role: "system",
       depth: injectionPosition,
-      ephemeral: true,
+      ephemeral: false,
     });
     injected = true;
   } catch (error) {
