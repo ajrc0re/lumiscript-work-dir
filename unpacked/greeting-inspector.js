@@ -36,9 +36,9 @@ const OLD_CHAT_VARIABLE_KEYS = {
 };
 
 const HANDOFF_TAG_NAME = "inject-prewritten-content";
-const USER_OVERRIDE_TAG_NAME = "request-prewritten-injection";
+const USER_OVERRIDE_TAG_NAME = "o";
 const HANDOFF_TAG = `<${HANDOFF_TAG_NAME} />`;
-const USER_OVERRIDE_TAG = `<${USER_OVERRIDE_TAG_NAME} />`;
+const USER_OVERRIDE_TAG = `--${USER_OVERRIDE_TAG_NAME}--`;
 const HANDOFF_EXTRA_KEY = "greetingInspectorSceneHandoff";
 const HANDOFF_CONTENT_PROCESSOR_ID = "greeting-inspector-scene-handoff-tags";
 const HANDOFF_TAG_PATTERN =
@@ -46,16 +46,17 @@ const HANDOFF_TAG_PATTERN =
 
 function buildShapeSceneDirectionPrompt(prewrittenSceneExcerpt) {
   return `<shape_scene_direction>
-- DIRECTION TARGET: An upcoming prewritten scene exists. Treat it as a private long-term destination for story direction, staging, character positioning, emotional setup, and momentum. Over many turns, guide the current narrative toward the exact conditions where that prewritten scene could begin immediately afterward. The goal is not to find a convenient fade-out. The goal is to narrate at a slow, natural pace as if these instructions didnt exist, naturally moving towards the next scene.
-- PACING AND HANDOFF SPEED: Do not transition too fast. It should take numerous turns to arrive at the next scene in most cases.Treat the upcoming prewritten scene as a long-term destination to earn through present-moment movement, not a marker to use at the first plausible pause.Prefer gradual movement toward the doorway of the upcoming prewritten scene over immediate marker use.Use the marker only when the current scene is already at the doorstep of the upcoming prewritten scene, or when the user's latest reply contains the user override marker.
-- LATE HANDOFF POLICY: Default to continuing the current narrative at a natural pace, NEVER try to 'bridge the gap' or arrive at the doorstep of the next scene unnaturally.Move steadily toward the upcoming prewritten scene over the course of several turns, keep writing the present moment until that prewritten scene is nearly ready to start.The handoff should usually happen at the latest viable point, often right before the prewritten scene would begin or at the instant it is about to begin.Do not hand off just because there is a calm moment, a completed emotional beat, a quiet pause, or a place where a normal scene ending would make sense. Do not use the marker as a fade to black, summary transition, curtain drop, chapter break, or convenient stopping point.
-- VALID HANDOFF THRESHOLD: Only hand off when the current scene has advanced to the doorstep of the upcoming prewritten scene.The next assistant message after the marker should be able to start the prewritten scene without needing extra setup, bridging, explanation, or repositioning.If another reply could still naturally move closer to the upcoming prewritten scene without contradicting the conversation, keep going instead of using the marker.When uncertain, do not hand off this turn, continue the narrative at a natural pace and guide it closer. NEVER timeskip multiple hours, days or weeks just to get to the threshold faster.
-– USER INJECTION REQUEST TAG: If the user's latest reply contains ${USER_OVERRIDE_TAG}, make a best-effort attempt to reach the doorstep sooner, while still avoiding unnatural bridging. This request does not by itself mean the prewritten content is ready to inject.
-- PREWRITTEN CONTENT INJECTION TAG: Only when the doorstep is reached, include ${HANDOFF_TAG} once in your response. This private control tag has exactly one purpose: instruct the host to inject the upcoming prewritten content. It is not a general marker for ending a narrative beat, passage, chapter, or other natural stopping point. It will be removed before the user sees the message. The tag does not need to be at the end but must be on its own line.
-- UPCOMING PREWRITTEN SCENE PRIVACY: Use the upcoming prewritten scene only as a target for deciding how to steer the current scene.
-- MANDATORY CONSTRAINT: Do not quote, summarize, paraphrase, adapt, preview, blend, or reuse any part of the prewritten scene. Do not use its URLs, images, formatting, headings, or exact details. DO NOT use it for anything other than a reference on what direction to guide the current scene. NEVER include ANY PORTION of the upcoming greeting in your response; it will be injected automatically when you send the marker.
+- DIRECTION TARGET: Treat the upcoming prewritten scene as a long-term destination. Gradually shape the narrative's setting, character positions, emotional state, and momentum so the scene can begin naturally and immediately afterward. Do not force a fade-out or make the guidance visible.
+- PACING AND HANDOFF: Reach the scene slowly over multiple turns. Continue the present narrative until its required conditions feel earned, rather than transitioning at the first plausible opportunity. Favor gradual progression toward the handoff point over immediate scene setup.
+- NARRATIVE SPACING MINIMUMS: Avoid placing major transitions or prewritten handoffs on the same day or on consecutive days. Unless the next scene is explicitly required to occur that day, allow at least one or two in-story days to pass before guiding the narrative toward it. If a handoff has already occurred that day, continue the story naturally without setting up another.
+- LATE HANDOFF POLICY: Continue the current narrative naturally until it reaches the doorstep of the upcoming prewritten scene. Move toward that point gradually across several turns without forcing a bridge or rushing the required setup. Trigger the handoff at the latest viable moment, ideally immediately before the scene begins. Do not hand off merely because of a calm pause, completed emotional beat, natural stopping point, fade-out, summary, chapter break, or other convenient ending.
+- VALID HANDOFF THRESHOLD: Hand off only when the narrative has reached the immediate starting point of the upcoming prewritten scene. The next assistant reply must be able to begin that scene without additional setup, explanation, bridging, or character repositioning. If the current narrative can still progress naturally toward that point, continue instead. When uncertain, delay the handoff and move closer at a normal pace. Never use a large time skip solely to reach the threshold faster.
+- USER INJECTION OVERRIDE TAG: If the user's latest reply contains ${USER_OVERRIDE_TAG}, override the normal pacing rules and use the next response to make a best-effort transition toward the handoff threshold. Force the narrative into the closest viable starting position for the upcoming prewritten scene, using only as much bridging, repositioning, or time progression as necessary. The following assistant response must include ${HANDOFF_TAG} exactly once, even if the threshold could not be reached perfectly.
+- PREWRITTEN CONTENT INJECTION TAG: Once the handoff threshold is fully reached, include ${HANDOFF_TAG} exactly once on its own line. This hidden control tag exists only to trigger insertion of the upcoming prewritten content. Do not use it as a scene ending, chapter break, fade-out, or general transition marker. It may appear anywhere in the response and will be removed before the user sees it.
+- PREWRITTEN SCENE PRIVACY: Use the upcoming prewritten scene only as a private directional reference for pacing and steering the current narrative.
+- MANDATORY CONSTRAINT: Do not quote, summarize, paraphrase, adapt, preview, merge, or reproduce any part of the prewritten scene. Do not copy its wording, details, URLs, images, formatting, or headings. The scene will be inserted automatically after the handoff tag, so none of its content may appear beforehand.
 
-UPCOMING PREWRITTEN SCENE, FOR TIMING ONLY:
+UPCOMING PREWRITTEN SCENE — DIRECTION AND TIMING REFERENCE ONLY:
 ${prewrittenSceneExcerpt}
 </shape_scene_direction>`;
 }
@@ -77,7 +78,7 @@ const STYLES_READY_KEY = "__greetingInspectorStylesReadyV3";
 const RECENT_TRANSITIONS_KEY = "__greetingInspectorRecentTransitionsV3";
 
 const MAX_DEBUG_LOG_LINES = 96;
-const PREWRITTEN_SCENE_PROMPT_CHAR_LIMIT = 1000;
+const PREWRITTEN_SCENE_PROMPT_CHAR_LIMIT = 2000;
 const CHAT_SWITCH_SETTLE_ATTEMPTS = 24;
 const CHAT_SWITCH_SETTLE_DELAY_MS = 125;
 const LATEST_MESSAGE_RETRY_ATTEMPTS = 10;
