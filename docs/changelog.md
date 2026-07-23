@@ -528,3 +528,57 @@ Lisa's chat button now lives in the script-manager toolbar (right next to the bu
 - Lisa speaks CSS now! She knows Lumiverse's full `--lumiverse-*` theme element system, so she can actually help you theme the app, write `api.theme` calls, or hand-roll `addStyle` CSS against the real elements.
 - Tidier code blocks in Lisa's chat: Copy/Apply moved into a clean header bar above the code (no more buttons overlapping the first line), with a language tag. Every block gets the toolbar now, even untagged ones.
 - New theme element reference in the docs and cookbook.
+
+### Update 1.6.0
+
+**`pierceShadow` for `api.ui.dom.delegate`**
+
+Lumiverse renders styled HTML in assistant messages inside isolated shadow-DOM islands, nice for styling, but it meant scripts couldn't wire up the buttons/inputs an LLM emits inside a styled block (the events never reached them). Now pass `{ pierceShadow: true }` and your delegation reaches controls inside those islands too (clicks, change on `<select>`/`<input>`):
+```js
+api.ui.dom.delegate('button[data-choice]', 'click', handler, { root: 'chat', pierceShadow: true })
+```
+Opt-in and fully backwards-compatible (default off)
+
+
+# Update 2.0.0
+
+The big one: LumiScript now has an **opt-in QuickJS-WASM isolate engine**. Scripts can run inside a WebAssembly VM where host globals like `Bun` and `process` simply don't exist — real structural isolation — with per-script memory/CPU limits, optional per-script context isolation, and graceful teardown.
+
+**Your scripts keep working.** AsyncFunction stays the *default* and is now the LTS engine; the `api.*` surface is unchanged. 2.0 is a major version because of the new engine, not because anything was removed. Switch to QuickJS in the LumiScript settings only when you want the stronger isolation, and switch back anytime.
+
+⚠️ **One heads-up:** outbound `fetch` to localhost/private-network addresses is now blocked by default (SSRF hardening). If a script talks to a local service, add its host to the new allowlist in settings.
+
+**Also new in 2.0:**
+- Per-script context isolation (QuickJS-only): one script can't touch another's globals or shared libs
+- Guarded outbound networking with a private-host allowlist you control
+- New Spindle surfaces: chat style modes, global world-info activation, `api.permissions`, persona add-ons
+- Engine and worker-pool diagnostics, plus a Download Report button
+- Sharper in-editor IntelliSense: type hints are now generated straight from the API contract, so they can't drift
+- Export-pack script picker, folder remove button, and a stack of smaller UI and UX fixes
+
+Full docs are in the repo and in-app through Lisa. Feedback and bug reports welcome, as always!
+
+
+
+
+### Update 2.0.1
+
+A small QuickJS engine-parity patch
+
+Running the default engine? Nothing changes and nothing breaks: the public `api.*` surface is untouched, so this is a safe update. If you've opted into the QuickJS engine, you get two fixes that bring it fully in line with the default:
+- Built-in `ls:*` libraries now load under QuickJS: `script.require('ls:components' | 'ls:icons' | 'ls:council-prompt')` works in QJS just like on the default engine (previously it threw)
+- `AbortSignal` now works under QuickJS, cancel an in-flight request or stream from inside a script:
+  - `api.llm.generateStream({ signal })`: cancel mid-stream (previously it rejected up front)
+  - `api.utils.http.*`, `api.llm.generate`, `api.llm.generateStructured`: `{ signal }` is now honoured (previously silently ignored)
+
+
+
+
+### Update 2.1.0
+
+- `api.utils.getEngine()`: returns `'asyncfn'` or `'quickjs'`, so a script can tell which engine it's running on
+- Console output on the QuickJS isolate now matches the AsyncFunction engine
+- A host change stopped dropdowns rendering inside LumiScript dialogs: the character picker in "Bundle scripts into a character card" and Lisa's connection picker both quietly lost their searchable selects; both are fixed and fully back
+
+
+

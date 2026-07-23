@@ -1,10 +1,10 @@
 // @ls:reload-on-edit
-const VERSION = "2026-06-30-persistent-auto-prompt";
+const VERSION = "2026-07-23-undo-floating-controls";
 
 const INJECTION_ID = "greeting-inspector-next-scene-note";
 const DRAWER_TAB_ID = "greeting-inspector-status";
 const STYLE_ID = "greeting-inspector-styles";
-const FLOATING_REFRESH_ID = "greeting-inspector-floating-refresh";
+const FLOATING_CONTROLS_ID = "greeting-inspector-floating-controls";
 const MODAL_STYLE_ID = "greeting-inspector-picker-styles";
 
 const ACTIVE_INDEX_VAR = "GreetingInspectorActiveIndex";
@@ -40,6 +40,7 @@ const USER_OVERRIDE_TAG_NAME = "o";
 const HANDOFF_TAG = `<${HANDOFF_TAG_NAME} />`;
 const USER_OVERRIDE_TAG = `--${USER_OVERRIDE_TAG_NAME}--`;
 const HANDOFF_EXTRA_KEY = "greetingInspectorSceneHandoff";
+const UNDO_METADATA_KEY = "greetingInspectorUndo";
 const HANDOFF_CONTENT_PROCESSOR_ID = "greeting-inspector-scene-handoff-tags";
 const HANDOFF_TAG_PATTERN =
   /<\s*inject-prewritten-content\b(?:[^>"']|"[^"]*"|'[^']*')*\/\s*>|<\s*inject-prewritten-content\b(?:[^>"']|"[^"]*"|'[^']*')*>([\s\S]*?)<\s*\/\s*inject-prewritten-content\s*>/gi;
@@ -451,6 +452,95 @@ function defaultUpcomingSelection(activeSelection, context) {
 
 function getGreetingBySelection(context, selection) {
   return context.greetingByKey[selectionKey(selection)] || null;
+}
+
+function undoMetadata(previousActiveSelection, previousUpcomingSelection, activeSelection) {
+  return {
+    version: 1,
+    previousActiveSelection: selectionPayload(
+      previousActiveSelection && previousActiveSelection.characterId,
+      previousActiveSelection && previousActiveSelection.index,
+    ),
+    previousUpcomingSelection: selectionPayload(
+      previousUpcomingSelection && previousUpcomingSelection.characterId,
+      previousUpcomingSelection && previousUpcomingSelection.index,
+    ),
+    activeSelection: selectionPayload(
+      activeSelection && activeSelection.characterId,
+      activeSelection && activeSelection.index,
+    ),
+  };
+}
+
+function exactUndoSelections(message, state) {
+  const metadata =
+    message && message.metadata && typeof message.metadata === "object" ?
+      message.metadata[UNDO_METADATA_KEY]
+    : null;
+
+  if (!metadata || typeof metadata !== "object" || metadata.version !== 1) {
+    return null;
+  }
+
+  const activeSelection = normalizeStoredSelection(
+    metadata.activeSelection,
+    state.context,
+  );
+  const previousActiveSelection = normalizeStoredSelection(
+    metadata.previousActiveSelection,
+    state.context,
+  );
+  const storedPreviousUpcoming = metadata.previousUpcomingSelection;
+  const previousUpcomingSelection =
+    storedPreviousUpcoming === null || !previousActiveSelection ?
+      null
+    : normalizeUpcomingSelection(
+        storedPreviousUpcoming,
+        previousActiveSelection,
+        state.context,
+      );
+
+  if (
+    !sameSelection(activeSelection, state.activeSelection) ||
+    !previousActiveSelection ||
+    sameSelection(previousActiveSelection, activeSelection) ||
+    (storedPreviousUpcoming !== null &&
+      (!previousActiveSelection || !previousUpcomingSelection))
+  ) {
+    return null;
+  }
+
+  return {
+    activeSelection: previousActiveSelection,
+    upcomingSelection: previousUpcomingSelection,
+    exact: true,
+  };
+}
+
+function fallbackUndoSelections(state) {
+  const activeSelection = normalizeStoredSelection(
+    state.activeSelection,
+    state.context,
+  );
+  if (!activeSelection) {
+    return null;
+  }
+
+  const greetings =
+    state.context.greetingsByCharacter[activeSelection.characterId] || [];
+  const previousGreeting = greetings
+    .filter((greeting) => greeting.index < activeSelection.index)
+    .sort((left, right) => right.index - left.index)[0];
+
+  if (!previousGreeting) {
+    return null;
+  }
+
+  return {
+    activeSelection: selectionFromGreeting(previousGreeting),
+    upcomingSelection: activeSelection,
+    exact: false,
+  };
 }
 
 function selectedCharacterState(context, selection) {
@@ -2434,6 +2524,39 @@ function buildStyles() {
   z-index: 2147483646;
 }
 
+.ls-gi-floating-controls {
+  width: 82px;
+  height: 30px;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  overflow: hidden;
+  background: var(--lumiverse-bg-elevated, #181818);
+  border: 1px solid var(--lumiverse-border, rgba(255, 255, 255, 0.18));
+  border-radius: 6px;
+}
+
+.ls-gi-floating-control {
+  min-width: 0;
+  min-height: 28px;
+  padding: 0 1px;
+  border: 0;
+  border-right: 1px solid var(--lumiverse-border, rgba(255, 255, 255, 0.18));
+  border-radius: 0;
+  font-size: 8px;
+  font-weight: 750;
+  letter-spacing: -0.2px;
+}
+
+.ls-gi-floating-control:last-child {
+  border-right: 0;
+}
+
+.ls-gi-floating-control.ls-gi-power-button {
+  width: auto;
+  min-height: 28px;
+  font-size: 8px;
+}
+
 .ls-gi-picker {
   height: min(78vh, 900px);
   min-height: min(560px, calc(100vh - 170px));
@@ -2527,22 +2650,46 @@ function refreshButtonHtml(id, busyAction) {
   return `<button class="ls-gi-button ls-gi-button-secondary ls-gi-refresh-button" id="${id}" data-action="refresh" type="button" title="Refresh Greeting Inspector for the active chat"${disabled}>${spinnerHtml(busy)}<span>Refresh</span></button>`;
 }
 
-function powerButtonHtml(state, busyAction) {
+function powerButtonHtml(state, busyAction, options = {}) {
   if (!state.character) {
-    return "";
+    if (!options.placeholder) {
+      return "";
+    }
+
+    const placeholderId = options.id || "ls-gi-power-toggle";
+    const placeholderClass = options.className ? ` ${options.className}` : "";
+    return `<button class="ls-gi-button ls-gi-power-button ls-gi-power-button-off${placeholderClass}" id="${placeholderId}" data-action="powerToggle" type="button" title="Open a character chat before changing Greeting Inspector" disabled aria-disabled="true"><span>OFF</span></button>`;
   }
 
   const enabled = state.inspectorEnabled !== false;
   const label = enabled ? "ON" : "OFF";
   const className =
     enabled ? "ls-gi-power-button-on" : "ls-gi-power-button-off";
+  const id = options.id || "ls-gi-power-toggle";
+  const extraClass = options.className ? ` ${options.className}` : "";
   const disabled = busyAction ? ' disabled aria-disabled="true"' : "";
   const title =
     enabled ?
       "Turn Greeting Inspector off for this character"
     : "Turn Greeting Inspector on for this character";
 
-  return `<button class="ls-gi-button ls-gi-power-button ${className}" id="ls-gi-power-toggle" data-action="powerToggle" type="button" title="${title}"${disabled}><span>${label}</span></button>`;
+  return `<button class="ls-gi-button ls-gi-power-button ${className}${extraClass}" id="${id}" data-action="powerToggle" type="button" title="${title}"${disabled}><span>${label}</span></button>`;
+}
+
+function undoButtonHtml(id, state, busyAction, className = "") {
+  const disabled = busyAction || !state.ready ?
+    ' disabled aria-disabled="true"'
+  : "";
+  const extraClass = className ? ` ${className}` : "";
+  return `<button class="ls-gi-button ls-gi-button-secondary${extraClass}" id="${id}" data-action="undo" type="button" title="Delete the latest active greeting message and restore the previous active and next greetings"${disabled}><span>Undo</span></button>`;
+}
+
+function forceButtonHtml(id, state, busyAction, className = "") {
+  const disabled = busyAction || !state.ready || !state.upcomingGreeting ?
+    ' disabled aria-disabled="true"'
+  : "";
+  const extraClass = className ? ` ${className}` : "";
+  return `<button class="ls-gi-button ls-gi-button-danger${extraClass}" id="${id}" data-action="force" type="button" title="Force the next greeting into chat"${disabled}><span>Force</span></button>`;
 }
 
 function indexLabel(greeting, includeCharacter = false) {
@@ -2624,7 +2771,8 @@ function buildDrawerHtml(state) {
         ${refreshButtonHtml("ls-gi-drawer-refresh", busyAction)}
         <button class="ls-gi-button ls-gi-button-secondary" id="ls-gi-active" data-action="active" type="button"${busyAction ? " disabled" : ""}><span>Active</span></button>
         <button class="ls-gi-button" id="ls-gi-next" data-action="upcoming" type="button"${busyAction || !canPickUpcoming ? " disabled" : ""}><span>Next</span></button>
-        <button class="ls-gi-button ls-gi-button-danger" id="ls-gi-force" data-action="force" type="button"${busyAction || !upcomingGreeting ? " disabled" : ""}><span>Force</span></button>
+        ${undoButtonHtml("ls-gi-undo", state, busyAction)}
+        ${forceButtonHtml("ls-gi-force", state, busyAction)}
       </div>
     </div>
   </div>
@@ -2676,8 +2824,20 @@ function buildDrawerHtml(state) {
 </div>`;
 }
 
-function buildFloatingRefreshHtml() {
-  return `<div class="ls-gi-floating-root">${refreshButtonHtml("ls-gi-floating-refresh", getBusyAction())}</div>`;
+function buildFloatingControlsHtml(state) {
+  const busyAction = getBusyAction();
+  return `
+<div class="ls-gi-floating-root">
+  <div class="ls-gi-floating-controls">
+    ${powerButtonHtml(state, busyAction, {
+      id: "ls-gi-floating-power-toggle",
+      className: "ls-gi-floating-control",
+      placeholder: true,
+    })}
+    ${undoButtonHtml("ls-gi-floating-undo", state, busyAction, "ls-gi-floating-control")}
+    ${forceButtonHtml("ls-gi-floating-force", state, busyAction, "ls-gi-floating-control")}
+  </div>
+</div>`;
 }
 
 function drawerTabIconSvg() {
@@ -2822,7 +2982,7 @@ async function renderDrawer(state) {
   }
 }
 
-async function attachFloatingRefreshHandlers(handle) {
+async function attachFloatingControlHandlers(handle) {
   unsubscribeByKey(FLOATING_CLICK_UNSUB_KEY);
   unsubscribeByKey(FLOATING_POINTER_UNSUB_KEY);
 
@@ -2839,7 +2999,8 @@ async function attachFloatingRefreshHandlers(handle) {
   globalThis[FLOATING_CLICK_UNSUB_KEY] = handle.on(
     "click",
     async (event) => {
-      if (actionFromEvent(event) !== "refresh") {
+      const action = actionFromEvent(event);
+      if (!action) {
         return;
       }
 
@@ -2852,20 +3013,20 @@ async function attachFloatingRefreshHandlers(handle) {
         const distance = Math.sqrt(dx * dx + dy * dy);
 
         if (distance > DRAG_CLICK_DISTANCE_PX) {
-          logDebug("floating refresh click ignored after drag", {
+          logDebug("floating control click ignored after drag", {
             distance: Math.round(distance),
           });
           return;
         }
       }
 
-      await handleUiAction("refresh", { source: "floating" });
+      await handleUiAction(action, { source: "floating" });
     },
     { preventDefault: true },
   );
 }
 
-async function renderFloatingRefresh() {
+async function renderFloatingControls(state) {
   if (!api.ui || !api.ui.dom || typeof api.ui.dom.inject !== "function") {
     return;
   }
@@ -2878,7 +3039,7 @@ async function renderFloatingRefresh() {
       try {
         snapshot = await handle.read();
       } catch (error) {
-        logDebug("floating refresh handle read failed", {
+        logDebug("floating control handle read failed", {
           error: error.message || String(error),
         });
       }
@@ -2890,32 +3051,32 @@ async function renderFloatingRefresh() {
     }
 
     if (handle && typeof handle.update === "function") {
-      await handle.update(buildFloatingRefreshHtml());
-      logDebug("floating refresh updated", { busy: getBusyAction() || "none" });
+      await handle.update(buildFloatingControlsHtml(state));
+      logDebug("floating controls updated", { busy: getBusyAction() || "none" });
       return;
     }
 
-    handle = await api.ui.dom.inject("body", buildFloatingRefreshHtml(), {
-      id: FLOATING_REFRESH_ID,
+    handle = await api.ui.dom.inject("body", buildFloatingControlsHtml(state), {
+      id: FLOATING_CONTROLS_ID,
       position: "beforeend",
     });
     globalThis[FLOATING_HANDLE_KEY] = handle;
 
     if (handle && typeof handle.makeDraggable === "function") {
-      handle.makeDraggable(".ls-gi-refresh-button");
+      handle.makeDraggable(".ls-gi-floating-controls");
     }
 
-    await attachFloatingRefreshHandlers(handle);
-    logDebug("floating refresh rendered", { busy: getBusyAction() || "none" });
+    await attachFloatingControlHandlers(handle);
+    logDebug("floating controls rendered", { busy: getBusyAction() || "none" });
   } catch (error) {
-    logDebug("floating refresh render failed", { error: error.message || String(error) });
+    logDebug("floating controls render failed", { error: error.message || String(error) });
   }
 }
 
 async function renderUi(state) {
   await ensureStyles();
   await renderDrawer(state);
-  await renderFloatingRefresh();
+  await renderFloatingControls(state);
 }
 
 function pickerOptions(kind, state) {
@@ -3346,13 +3507,16 @@ async function resolveTransitionSource(eventName) {
   return null;
 }
 
-function beginGreetingMessageInsert(greeting) {
+function beginGreetingMessageInsert(greeting, history = null) {
   if (!greeting || !greeting.text) {
     logDebug("insert skipped", { reason: "empty greeting" });
     return Promise.resolve(false);
   }
 
-  const baseOptions = { role: "assistant" };
+  const baseOptions = {
+    role: "assistant",
+    ...(history ? { metadata: { [UNDO_METADATA_KEY]: history } } : {}),
+  };
 
   try {
     return api.chat.sendMessage(greeting.text, baseOptions)
@@ -3382,8 +3546,8 @@ function beginGreetingMessageInsert(greeting) {
   }
 }
 
-async function insertGreetingMessage(greeting) {
-  return beginGreetingMessageInsert(greeting);
+async function insertGreetingMessage(greeting, history = null) {
+  return beginGreetingMessageInsert(greeting, history);
 }
 
 async function advanceToUpcomingGreeting(state, source = "manual") {
@@ -3398,6 +3562,11 @@ async function advanceToUpcomingGreeting(state, source = "manual") {
   const automaticTransition = TRANSITION_EVENTS.has(source);
   const previousActiveSelection = state.activeSelection;
   const previousUpcomingSelection = state.upcomingSelection;
+  const history = undoMetadata(
+    previousActiveSelection,
+    previousUpcomingSelection,
+    advancedSelection,
+  );
 
   logDebug("advance requested", {
     source,
@@ -3418,7 +3587,7 @@ async function advanceToUpcomingGreeting(state, source = "manual") {
   }
 
   if (automaticTransition) {
-    const insertPromise = beginGreetingMessageInsert(advancedGreeting);
+    const insertPromise = beginGreetingMessageInsert(advancedGreeting, history);
     const stateWritePromise = writeActiveSelection(advancedSelection, state.context, {
       confirm: false,
       skipLegacyCleanup: true,
@@ -3494,7 +3663,7 @@ async function advanceToUpcomingGreeting(state, source = "manual") {
     upcoming: state.upcomingSelection ? selectionKey(state.upcomingSelection) : "none",
   });
 
-  const insertedGreeting = await insertGreetingMessage(advancedGreeting);
+  const insertedGreeting = await insertGreetingMessage(advancedGreeting, history);
 
   if (!insertedGreeting) {
     state.activeSelection = await writeActiveSelection(previousActiveSelection, state.context);
@@ -3837,6 +4006,142 @@ async function handleForceAdvance() {
   );
 }
 
+function normalizedGreetingMessageContent(value) {
+  return String(value ?? "").replace(/\r\n?/g, "\n").trim();
+}
+
+function latestMessageMatchesActiveGreeting(message, state) {
+  const activeGreetingContent = normalizedGreetingMessageContent(
+    state.activeGreeting && state.activeGreeting.text,
+  );
+  return Boolean(
+    message &&
+    message.role === "assistant" &&
+    asText(message.id) &&
+    activeGreetingContent &&
+    normalizedGreetingMessageContent(chatMessageContent(message)) ===
+      activeGreetingContent
+  );
+}
+
+async function restoreSelectionPair(activeSelection, upcomingSelection, context) {
+  const restoredActiveSelection = await writeActiveSelection(
+    activeSelection,
+    context,
+  );
+  const restoredUpcomingSelection = await writeUpcomingSelection(
+    upcomingSelection,
+    restoredActiveSelection,
+    context,
+  );
+
+  return {
+    activeSelection: restoredActiveSelection,
+    upcomingSelection: restoredUpcomingSelection,
+  };
+}
+
+async function undoLatestGreeting(state) {
+  if (!api.chat || typeof api.chat.deleteMessage !== "function") {
+    throw new Error("Chat message deletion is unavailable.");
+  }
+
+  const latestMessage = await getLatestChatMessage();
+  if (!latestMessageMatchesActiveGreeting(latestMessage, state)) {
+    return {
+      undone: false,
+      reason:
+        "UNDO requires the latest chat message to be the current active greeting.",
+    };
+  }
+
+  const targetSelections =
+    exactUndoSelections(latestMessage, state) || fallbackUndoSelections(state);
+  if (!targetSelections) {
+    return {
+      undone: false,
+      reason: "There is no previous greeting available to restore.",
+    };
+  }
+
+  await ensureActiveChatStill(state.chat && state.chat.id, "Undo transition");
+
+  try {
+    await restoreSelectionPair(
+      targetSelections.activeSelection,
+      targetSelections.upcomingSelection,
+      state.context,
+    );
+    await ensureActiveChatStill(state.chat && state.chat.id, "Undo transition");
+    const confirmedLatestMessage = await getLatestChatMessage();
+    if (
+      !latestMessageMatchesActiveGreeting(confirmedLatestMessage, state) ||
+      confirmedLatestMessage.id !== latestMessage.id
+    ) {
+      throw new Error(
+        "Undo transition cancelled because the latest chat message changed.",
+      );
+    }
+    await api.chat.deleteMessage(latestMessage.id);
+  } catch (error) {
+    try {
+      await ensureActiveChatStill(state.chat && state.chat.id, "Undo rollback");
+      await restoreSelectionPair(
+        state.activeSelection,
+        state.upcomingSelection,
+        state.context,
+      );
+    } catch (rollbackError) {
+      logDebug("undo rollback failed", {
+        error: rollbackError.message || String(rollbackError),
+      });
+    }
+    throw error;
+  }
+
+  logDebug("greeting transition undone", {
+    deletedMessageId: latestMessage.id,
+    from: selectionKey(state.activeSelection),
+    active: selectionKey(targetSelections.activeSelection),
+    upcoming:
+      targetSelections.upcomingSelection ?
+        selectionKey(targetSelections.upcomingSelection)
+      : "none",
+    exact: targetSelections.exact,
+  });
+
+  return {
+    undone: true,
+    exact: targetSelections.exact,
+  };
+}
+
+async function handleUndoAdvance() {
+  const state = await refreshPipeline({ reason: "undo prepare" });
+  if (!state.ready) {
+    api.ui.toast(state.reason || "Greeting Inspector is inactive.", "warning");
+    return;
+  }
+
+  await ensureActiveChatStill(state.chat && state.chat.id, "Undo transition");
+  const result = await undoLatestGreeting(state);
+  if (!result.undone) {
+    api.ui.toast(result.reason, "warning");
+    return;
+  }
+
+  const refreshedState = await refreshPipeline({ reason: "undo complete" });
+  if (!refreshedState.ready) {
+    api.ui.toast(refreshedState.reason || "Greeting Inspector is inactive.", "warning");
+    return;
+  }
+
+  api.ui.toast(
+    `Undid greeting transition. Active greeting is ${activeGreetingLabel(refreshedState)}. ${nextGreetingMessage(refreshedState)} ${promptContentMessage(refreshedState.sync)}`,
+    refreshedState.sync && refreshedState.sync.error ? "warning" : "success",
+  );
+}
+
 async function handleAutoPromptChange(checked) {
   const state = await refreshPipeline({ reason: "auto prompt prepare" });
   if (!state.ready) {
@@ -3949,6 +4254,11 @@ async function handleUiAction(action, options = {}) {
       return;
     }
 
+    if (action === "undo") {
+      await handleUndoAdvance();
+      return;
+    }
+
     if (action === "autoPrompt") {
       await handleAutoPromptChange(Boolean(options.checked));
       return;
@@ -3981,6 +4291,8 @@ async function teardown() {
   unsubscribeByKey(DRAWER_CLICK_UNSUB_KEY);
   unsubscribeByKey(DRAWER_CHANGE_UNSUB_KEY);
   unsubscribeByKey(FLOATING_CLICK_UNSUB_KEY);
+  unsubscribeByKey(FLOATING_POINTER_UNSUB_KEY);
+  globalThis[FLOATING_POINTER_START_KEY] = null;
   await removeInjectedNote();
   await writeInspectorActive(null, false);
   await writeInspectorContent(null, "");
