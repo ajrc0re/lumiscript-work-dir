@@ -1,5 +1,5 @@
 // @ls:reload-on-edit
-const VERSION = "2026-07-23-undo-floating-controls";
+const VERSION = "2026-07-23-vertical-floating-controls";
 
 const INJECTION_ID = "greeting-inspector-next-scene-note";
 const DRAWER_TAB_ID = "greeting-inspector-status";
@@ -2525,10 +2525,11 @@ function buildStyles() {
 }
 
 .ls-gi-floating-controls {
-  width: 82px;
-  height: 30px;
+  width: 56px;
+  height: 144px;
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: repeat(4, minmax(0, 1fr));
   overflow: hidden;
   background: var(--lumiverse-bg-elevated, #181818);
   border: 1px solid var(--lumiverse-border, rgba(255, 255, 255, 0.18));
@@ -2537,24 +2538,58 @@ function buildStyles() {
 
 .ls-gi-floating-control {
   min-width: 0;
-  min-height: 28px;
+  min-height: 0;
   padding: 0 1px;
   border: 0;
-  border-right: 1px solid var(--lumiverse-border, rgba(255, 255, 255, 0.18));
+  border-bottom: 1px solid var(--lumiverse-border, rgba(255, 255, 255, 0.18));
   border-radius: 0;
-  font-size: 8px;
+  font-size: 9px;
   font-weight: 750;
   letter-spacing: -0.2px;
 }
 
-.ls-gi-floating-control:last-child {
-  border-right: 0;
+.ls-gi-floating-force {
+  border-bottom: 0;
 }
 
 .ls-gi-floating-control.ls-gi-power-button {
   width: auto;
-  min-height: 28px;
-  font-size: 8px;
+  min-height: 0;
+  font-size: 9px;
+}
+
+.ls-gi-floating-drag-handle {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  color: var(--lumiverse-text-muted, rgba(245, 245, 245, 0.72));
+  background: var(--lumiverse-fill-subtle, rgba(255, 255, 255, 0.06));
+  border: 0;
+  border-bottom: 1px solid var(--lumiverse-border, rgba(255, 255, 255, 0.18));
+  font: inherit;
+  cursor: grab;
+  user-select: none;
+}
+
+.ls-gi-floating-drag-handle:active {
+  cursor: grabbing;
+}
+
+.ls-gi-floating-help-icon {
+  width: 16px;
+  height: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 750;
+  line-height: 1;
+  pointer-events: none;
 }
 
 .ls-gi-picker {
@@ -2826,16 +2861,23 @@ function buildDrawerHtml(state) {
 
 function buildFloatingControlsHtml(state) {
   const busyAction = getBusyAction();
+  const upcomingTooltip =
+    state.ready && state.upcomingGreeting ?
+      `Next greeting: ${upcomingGreetingLabel(state)}\n\n${displayGreeting(state.upcomingGreeting.text)}`
+    : "Next greeting: none";
   return `
 <div class="ls-gi-floating-root">
   <div class="ls-gi-floating-controls">
+    <button class="ls-gi-floating-drag-handle" type="button" title="${escapeHtml(upcomingTooltip)}" aria-label="${escapeHtml(upcomingTooltip)}">
+      <span class="ls-gi-floating-help-icon" aria-hidden="true">?</span>
+    </button>
     ${powerButtonHtml(state, busyAction, {
       id: "ls-gi-floating-power-toggle",
-      className: "ls-gi-floating-control",
+      className: "ls-gi-floating-control ls-gi-floating-power",
       placeholder: true,
     })}
-    ${undoButtonHtml("ls-gi-floating-undo", state, busyAction, "ls-gi-floating-control")}
-    ${forceButtonHtml("ls-gi-floating-force", state, busyAction, "ls-gi-floating-control")}
+    ${undoButtonHtml("ls-gi-floating-undo", state, busyAction, "ls-gi-floating-control ls-gi-floating-undo")}
+    ${forceButtonHtml("ls-gi-floating-force", state, busyAction, "ls-gi-floating-control ls-gi-floating-force")}
   </div>
 </div>`;
 }
@@ -3001,6 +3043,7 @@ async function attachFloatingControlHandlers(handle) {
     async (event) => {
       const action = actionFromEvent(event);
       if (!action) {
+        globalThis[FLOATING_POINTER_START_KEY] = null;
         return;
       }
 
@@ -3063,7 +3106,7 @@ async function renderFloatingControls(state) {
     globalThis[FLOATING_HANDLE_KEY] = handle;
 
     if (handle && typeof handle.makeDraggable === "function") {
-      handle.makeDraggable(".ls-gi-floating-controls");
+      handle.makeDraggable(".ls-gi-floating-drag-handle");
     }
 
     await attachFloatingControlHandlers(handle);
