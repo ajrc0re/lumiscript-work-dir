@@ -1,5 +1,5 @@
 // @ls:reload-on-edit
-const VERSION = "2026-07-23-vertical-floating-controls";
+const VERSION = "2026-07-23-narrow-tall-floating-controls";
 
 const INJECTION_ID = "greeting-inspector-next-scene-note";
 const DRAWER_TAB_ID = "greeting-inspector-status";
@@ -2525,8 +2525,8 @@ function buildStyles() {
 }
 
 .ls-gi-floating-controls {
-  width: 56px;
-  height: 144px;
+  width: 28px;
+  height: 192px;
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   grid-template-rows: repeat(4, minmax(0, 1fr));
