@@ -1,6 +1,6 @@
 # LumiScript Reference
 
-*Exported 2026-06-26*
+*Exported 2026-08-18*
 
 ---
 
@@ -142,6 +142,8 @@ For state that needs to survive across fires, pick one of:
 | `api.chat.isMessageHidden` | `chat_mutation` |
 | `api.chat.registerContentProcessor` | `chat_mutation` |
 | `api.chat.listContentProcessors` | *none* |
+| `api.chat.setStyleMode` | `app_manipulation` |
+| `api.chat.onMessageTag` | `chat_mutation` |
 
 ### LLM
 
@@ -156,6 +158,7 @@ For state that needs to survive across fires, pick one of:
 | `api.webSearch.*` | `web_search` |
 | `api.users.* (read-only)` | *none* |
 | `api.version.* (read-only)` | *none* |
+| `api.permissions.* (read-only)` | *none* |
 
 ### Variables / JSON / Utils
 
@@ -204,7 +207,7 @@ For state that needs to survive across fires, pick one of:
 | --- | --- |
 | `api.characters.*` | `characters` |
 | `api.chats.*` | `chats` |
-| `api.worldInfo.* (CRUD + getCapturedActive)` | `world_books` |
+| `api.worldInfo.* (CRUD + getCapturedActive + global activation)` | `world_books` |
 | `api.worldInfo.registerInterceptor / listInterceptors` | `generation` |
 | `api.personas.*` | `personas` |
 | `api.presets.*` | `presets` |
@@ -2762,6 +2765,8 @@ Deliberate omissions: computed styles, bounding rect, recursive child snapshots,
 | `setMessageHidden` | id, hidden | Mark a single message as hidden or visible. Hidden messages are excluded from vector retrieval but still included in prompt assembly. Toggle pattern: pass `true` to hide, `false` to unhide. Persists on the message — survives reloads. Requires chat_mutation permission. |
 | `setMessagesHidden` | ids, hidden | Bulk variant of `setMessageHidden`. Max 500 IDs per call. Same hidden-flag semantics (excluded from vector retrieval, still included in prompt assembly). Requires chat_mutation permission. |
 | `isMessageHidden` | id | Check whether a message is hidden. Returns false for messages that have never had the flag set (default state). Requires chat_mutation permission. |
+| `setStyleMode` | mode | Set the active chat's CSS containment mode. 'bounded' (default) clamps extension- and card-injected content inside the message stream; 'extension-relaxed' lets a `position: fixed` element injected into a message paint at viewport scope — e.g. a full-bleed overlay from an injected-DOM or card script. Distinct from `api.ui.mountApp` (a host-owned document.body portal): this relaxes the in-chat container. Requires app_manipulation permission. |
+| `onMessageTag` | tagName, handler, options? | Register a handler for a custom XML-like tag in chat messages (e.g. `<dice>3d6</dice>`). The handler receives a MessageTagEvent (tagName, content, attrs, messageId). `options.removeFromMessage` strips the tag from the rendered message. Returns an unsubscribe function. Requires chat_mutation permission. |
 
 ### api.llm
 
@@ -2803,6 +2808,13 @@ Deliberate omissions: computed styles, bounding rect, recursive child snapshots,
 | `getBackend` | — | The running Lumiverse backend server's semantic version string (e.g. '1.2.0'). Returns Promise&lt;string&gt;. Free tier. Pair with feature gating / compatibility checks. |
 | `getFrontend` | — | The running Lumiverse frontend bundle's semantic version string. Returns Promise&lt;string&gt;. Free tier. |
 
+### api.permissions
+
+| Method | Arguments | Description |
+| --- | --- | --- |
+| `getGranted` | — | The Spindle permissions currently granted to the LumiScript extension (e.g. ['chat_mutation', 'generation']). Extension-level, not per-script. Returns Promise&lt;string[]&gt;. Free tier. |
+| `has` | permission | Whether a specific permission is currently granted. Returns Promise&lt;boolean&gt;. Use as a pre-flight check before a gated call — if (await api.permissions.has('images')) { … } — so a script degrades gracefully instead of catching a PERMISSION_DENIED error after the fact. Free tier. |
+
 ### api.variables.local / .global / .character / .chat
 
 | Method | Arguments | Description |
@@ -2836,6 +2848,7 @@ Deliberate omissions: computed styles, bounding rect, recursive child snapshots,
 | --- | --- | --- |
 | `uuid` | — | Generate a UUID v4 string. Cryptographically random (uses crypto.randomUUID). |
 | `shortId` | — | Generate a short random ID (8 chars, URL-safe). Cryptographically random (derived from crypto.randomUUID). |
+| `getEngine` | — | The script engine running this run: `asyncfn` (default) or `quickjs` (the opt-in WASM isolate). Synchronous. Reflects the cold-start fallback — a run that requested quickjs but could not warm the isolate reports `asyncfn`. |
 | `wait` | ms | Pause execution for ms milliseconds. |
 | `random.int` | min, max | Random integer in [min, max] inclusive. **NOT cryptographically secure** — uses Math.random for gameplay/UI use cases. For tokens or security-sensitive identifiers use api.utils.uuid / shortId or globalThis.crypto.getRandomValues. |
 | `random.float` | min, max | Random float in [min, max). **NOT cryptographically secure** (Math.random — see random.int). |
@@ -3004,6 +3017,10 @@ Deliberate omissions: computed styles, bounding rect, recursive child snapshots,
 | `entries.delete` | entryId | Delete an entry by ID. |
 | `entries.listByAutomationIdPrefix` | prefix | Find all entries across all world books whose automationId starts with the given prefix. Useful for enumerating / cleaning up entries a script owns (e.g. "lumiscript:&lt;scriptId&gt;:" convention). Returns WorldInfoEntry[]; O(books × entries-per-book). |
 | `getCapturedActive` | chatId? | Get all entries that would activate for the current chat (full pipeline). |
+| `getGlobal` | — | Read the IDs of the user's globally-active world books — books applied to EVERY chat, independent of character/chat scope. Requires world_books permission. |
+| `setGlobal` | refs | Replace the set of globally-active world books. Refs accept a name or UUID (resolved like get/update/delete). Returns the applied ID list; refs that don't resolve to an existing book are dropped by the host. Requires world_books permission. |
+| `activateGlobal` | ref | Activate a single world book globally (name or UUID). Returns the updated global ID list. Throws if the book does not exist. Requires world_books permission. |
+| `deactivateGlobal` | ref | Deactivate a single globally-active world book (name or UUID). No-op if it was not active. Returns the updated global ID list. Requires world_books permission. |
 | `registerInterceptor` | handler, options? | Register a handler that runs BEFORE world info activation. Returns disable / enable / force / mutate decisions for the candidate entries. Returns handle { id, remove }. Multiple handlers compose by priority; vote-off precedence on disabled. 2s soft timeout (configurable). Requires generation. |
 | `listInterceptors` | — | Sync read of all currently-registered world-info interceptors. Diagnostic surface. Returns RegisteredWorldInfoInterceptorInfo[]. |
 
@@ -3128,6 +3145,9 @@ Deliberate omissions: computed styles, bounding rect, recursive child snapshots,
 | `delete` | personaId | Delete a persona. |
 | `switchActive` | personaId | Switch the active persona. Pass `personaId: string` to activate a persona, or `null` to deactivate. |
 | `getWorldBook` | personaId | Get the world book attached to a persona. |
+| `addons.list` | options? | List global add-ons — named, sortable injectable content blocks (persona-adjacent). Paginated { data, total }. Requires personas permission. |
+| `addons.get` | addonId | Get a global add-on by ID — resolves an add-on-state ID (from a generation's personaAddonStates) to its label + content. Returns null if not found. Requires personas permission. |
+| `addons.update` | addonId, input | Update a global add-on (partial: label / content / sortOrder / metadata). Authoring + removal stay in the host UI. Requires personas permission. |
 
 ### api.presets
 
