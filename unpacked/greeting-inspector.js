@@ -1,5 +1,5 @@
 // @ls:reload-on-edit
-const VERSION = "2026-07-23-narrow-tall-floating-controls";
+const VERSION = "2026-08-25-resume-safe-floating-controls";
 
 const INJECTION_ID = "greeting-inspector-next-scene-note";
 const DRAWER_TAB_ID = "greeting-inspector-status";
@@ -77,6 +77,7 @@ const DEBUG_LOG_KEY = "__greetingInspectorDebugLogV3";
 const REFRESH_REVISION_KEY = "__greetingInspectorRefreshRevisionV3";
 const STYLES_READY_KEY = "__greetingInspectorStylesReadyV3";
 const RECENT_TRANSITIONS_KEY = "__greetingInspectorRecentTransitionsV3";
+const LAST_RENDERED_STATE_KEY = "__greetingInspectorLastRenderedStateV3";
 
 const MAX_DEBUG_LOG_LINES = 96;
 const PREWRITTEN_SCENE_PROMPT_CHAR_LIMIT = 2000;
@@ -960,6 +961,7 @@ function clearCachedHandles() {
   globalThis[FLOATING_POINTER_UNSUB_KEY] = null;
   globalThis[FLOATING_POINTER_START_KEY] = null;
   globalThis[STYLES_READY_KEY] = false;
+  globalThis[LAST_RENDERED_STATE_KEY] = null;
 }
 
 async function sleep(ms) {
@@ -3075,45 +3077,45 @@ async function renderFloatingControls(state) {
   }
 
   try {
-    let handle = globalThis[FLOATING_HANDLE_KEY];
-
-    if (handle && typeof handle.read === "function") {
-      let snapshot = null;
-      try {
-        snapshot = await handle.read();
-      } catch (error) {
-        logDebug("floating control handle read failed", {
-          error: error.message || String(error),
-        });
-      }
-
-      if (!snapshot) {
-        handle = null;
-        globalThis[FLOATING_HANDLE_KEY] = null;
-      }
-    }
-
-    if (handle && typeof handle.update === "function") {
-      await handle.update(buildFloatingControlsHtml(state));
-      logDebug("floating controls updated", { busy: getBusyAction() || "none" });
-      return;
-    }
-
-    handle = await api.ui.dom.inject("body", buildFloatingControlsHtml(state), {
+    const hadCachedHandle = Boolean(globalThis[FLOATING_HANDLE_KEY]);
+    // Stable-ID injection recreates a missing widget or updates the existing
+    // one without the frontend round-trip required by DOMHandle.read(). The
+    // host clears listeners on the update path, so always attach fresh ones.
+    const handle = api.ui.dom.inject("body", buildFloatingControlsHtml(state), {
       id: FLOATING_CONTROLS_ID,
       position: "beforeend",
     });
     globalThis[FLOATING_HANDLE_KEY] = handle;
+    globalThis[LAST_RENDERED_STATE_KEY] = state;
 
-    if (handle && typeof handle.makeDraggable === "function") {
+    if (!hadCachedHandle && handle && typeof handle.makeDraggable === "function") {
       handle.makeDraggable(".ls-gi-floating-drag-handle");
     }
 
     await attachFloatingControlHandlers(handle);
-    logDebug("floating controls rendered", { busy: getBusyAction() || "none" });
+    logDebug("floating controls rendered and handlers repaired", {
+      busy: getBusyAction() || "none",
+    });
   } catch (error) {
     logDebug("floating controls render failed", { error: error.message || String(error) });
   }
+}
+
+async function repairFloatingControls(reason) {
+  let state = globalThis[LAST_RENDERED_STATE_KEY];
+  let stateSource = "cached";
+
+  // The common wake path uses the last rendered state and performs only
+  // fire-and-forget UI writes. Rehydrate from backend state only when a
+  // fresh worker has no render cache yet.
+  if (!state || typeof state !== "object") {
+    state = await loadState({ persistDerivedState: false });
+    stateSource = "rehydrated";
+  }
+
+  await ensureStyles();
+  await renderFloatingControls(state);
+  logDebug("floating controls wake repair complete", { reason, stateSource });
 }
 
 async function renderUi(state) {
@@ -4389,6 +4391,11 @@ async function main() {
 
   if (isTeardown(eventName)) {
     await teardown();
+    return;
+  }
+
+  if (eventName === "SETTINGS_UPDATED" && !isActiveChatSettingChange(eventName)) {
+    await repairFloatingControls("settings updated");
     return;
   }
 
